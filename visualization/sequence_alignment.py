@@ -385,42 +385,101 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
     )
     
     # Add tracks for each entry in data table
+    print(f"\n=== Generating track data in parallel for {len(all_data)} rows ===")
+    
+    # Prepare arguments for parallel execution
+    track_jobs = []
     for i, data in enumerate(all_data):
-        print(f"\n=== Rendering {data['name']} (row {i+1}) ===")
-        
-        # Get consensus residues for this cluster (if it's a medoid)
         consensus_residues = None
         if 'cluster_id' in data and data['cluster_id'] in consensus_by_cluster:
             consensus_residues = consensus_by_cluster[data['cluster_id']]
-            print(f"  → Passing {len(consensus_residues)} consensus residues to {data['name']}")
-        else:
-            print(f"  → No consensus residues for {data['name']} (cluster_id: {data.get('cluster_id', 'N/A')})")
         
-        add_sequence_track(
-            fig,
-            data['sequence'],
-            data['ss'],
-            data['plddt'],
-            row=i + 1,
-            offset=data['offset'],
-            reference_length=reference_length,
-            max_span=max_span,
-            consensus_residues=consensus_residues
+        track_jobs.append({
+            'sequence': data['sequence'],
+            'ss_codes': data['ss'],
+            'plddt_values': data['plddt'],
+            'row': i + 1,
+            'offset': data['offset'],
+            'reference_length': reference_length,
+            'max_span': max_span,
+            'consensus_residues': consensus_residues
+        })
+    
+    # Generate all track data in parallel
+    track_results = []
+    max_workers = min(multiprocessing.cpu_count(), len(track_jobs))
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                generate_sequence_track_data,
+                job['sequence'], job['ss_codes'], job['plddt_values'],
+                job['row'], job['offset'], job['reference_length'],
+                job['max_span'], job['consensus_residues']
+            ): job['row'] for job in track_jobs
+        }
+        
+        for future in as_completed(futures):
+            row_num = futures[future]
+            try:
+                result = future.result()
+                track_results.append(result)
+                print(f"  ✓ Row {row_num} complete: {len(result['shapes'])} shapes")
+            except Exception as e:
+                print(f"  ✗ Row {row_num} failed: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    # Sort results by row number
+    track_results.sort(key=lambda x: x['row'])
+    
+    # Combine all shapes, annotations, and traces
+    print(f"\n=== Combining results and updating figure ===")
+    all_shapes = []
+    all_annotations = []
+    
+    for result in track_results:
+        all_shapes.extend(result['shapes'])
+        all_annotations.extend(result['annotations'])
+        if result['trace']:
+            fig.add_trace(result['trace'], row=result['row'], col=1)
+    
+    # Update figure with all shapes and annotations at once
+    print(f"  Adding {len(all_shapes)} shapes and {len(all_annotations)} annotations...")
+    if all_shapes:
+        fig.update_layout(shapes=tuple(all_shapes))
+    if all_annotations:
+        fig.update_layout(annotations=tuple(all_annotations))
+    
+    # Update all axes
+    for i in range(1, len(all_data) + 1):
+        fig.update_xaxes(
+            title_text="Residue Position", row=i, col=1,
+            showticklabels=True, tickmode='auto'
+        )
+        fig.update_yaxes(
+            showticklabels=False, range=[-0.1, 1.1], row=i, col=1
         )
     
     fig.update_layout(
         title='Cluster Medoid Sequence Alignment',
         height=200 * n_rows,  # Increased height per row for better spacing
-        showlegend=True
+        showlegend=False  # No legend needed
     )
     
-    # Set x-axis range to exactly match sequence positions (remove margins)
+    # Set x-axis range and y-axis for all subplots
     for i in range(1, n_rows + 1):
         xaxis_key = 'xaxis' if i == 1 else f'xaxis{i}'
+        yaxis_key = 'yaxis' if i == 1 else f'yaxis{i}'
         fig.update_layout({
             xaxis_key: dict(
-                range=[0.5, reference_length + 0.5],  # Center residues at integer positions
+                range=[0.5, reference_length + 0.5],
                 constrain='domain'
+            ),
+            yaxis_key: dict(
+                range=[-0.1, 1.1],
+                fixedrange=False,
+                showticklabels=False
             )
         })
     
@@ -513,15 +572,15 @@ def create_alignment_visualization_within_cluster(pdb_files, labels, cluster_id,
     return fig
 
 
-def add_sequence_track(fig, sequence, ss_codes, plddt_values, row, offset=0, reference_length=0, max_span=0, consensus_residues=None):
+def generate_sequence_track_data(sequence, ss_codes, plddt_values, row, offset=0, reference_length=0, max_span=0, consensus_residues=None):
     """
-    Add a sequence track with two-row visualization:
-    - Top row: colored by pLDDT confidence
-    - Bottom row: colored by DSSP secondary structure
+    Generate shape/annotation data for a sequence track (parallelizable).
+    
+    Returns a dictionary with shapes, annotations, and trace data.
+    This function is pure and can be run in parallel for multiple rows.
     
     Parameters:
     -----------
-    fig : plotly Figure
     sequence : str
         Amino acid sequence
     ss_codes : list of str or None
@@ -538,176 +597,120 @@ def add_sequence_track(fig, sequence, ss_codes, plddt_values, row, offset=0, ref
         Maximum span across all sequences (for x-axis range)
     consensus_residues : list of int, optional
         List of consensus contact residue numbers to highlight
+    
+    Returns:
+    --------
+    dict : {
+        'shapes': list of shape dicts,
+        'annotations': list of annotation dicts,
+        'trace': plotly trace object,
+        'row': int
+    }
     """
-    print(f"  add_sequence_track called: row={row}, seq_len={len(sequence) if sequence else 0}, "
-          f"has_ss={ss_codes is not None}, has_plddt={plddt_values is not None}, offset={offset}, "
-          f"ref_len={reference_length}, max_span={max_span}, "
-          f"consensus_count={len(consensus_residues) if consensus_residues else 0}")
+    print(f"  generate_track_data: row={row}, seq_len={len(sequence) if sequence else 0}, "
+          f"offset={offset}, ref_len={reference_length}, consensus={len(consensus_residues) if consensus_residues else 0}")
     
     if not sequence or len(sequence) == 0:
         print(f"  WARNING: Empty sequence for row {row}")
-        return
+        return {'shapes': [], 'annotations': [], 'trace': None, 'row': row}
     
     seq_len = len(sequence)
     seq_start = offset + 1
     seq_end = offset + seq_len
+    total_length = reference_length if reference_length > 0 else seq_end
     
-    # Gap colors (light grey)
-    gap_plddt_color = 'rgba(240, 240, 240, 0.3)'
-    gap_ss_color = 'rgba(240, 240, 240, 0.2)'
+    # === BUILD DATA ARRAYS ===
+    plddt_array = np.full(total_length, -10.0)
+    ss_array = np.full(total_length, -1.0)
     
-    # Secondary structure color map
-    ss_color_map = {
-        'H': 'rgba(255, 0, 0, 0.8)',      # Red - Alpha helix
-        'G': 'rgba(255, 100, 0, 0.8)',    # Orange - 3-10 helix
-        'I': 'rgba(255, 150, 150, 0.8)',  # Pink - Pi helix
-        'E': 'rgba(0, 0, 255, 0.8)',      # Blue - Beta sheet
-        'B': 'rgba(100, 100, 255, 0.8)',  # Light blue - Beta bridge
-        'T': 'rgba(0, 200, 0, 0.8)',      # Green - Turn
-        'S': 'rgba(200, 200, 0, 0.8)',    # Yellow - Bend
-        'C': 'rgba(200, 200, 200, 0.5)',  # Gray - Coil
-        '-': 'rgba(200, 200, 200, 0.5)',  # Gray - Undefined
+    # SS code to numeric mapping
+    ss_map = {
+        'H': 1, 'G': 2, 'I': 3, 'E': 4, 'B': 5, 'T': 6, 'S': 7, 'C': 0, '-': 0
     }
     
+    # Fill in actual sequence data
+    for i in range(seq_len):
+        pos_idx = seq_start + i - 1
+        
+        if plddt_values is not None and i < len(plddt_values):
+            plddt_array[pos_idx] = plddt_values[i]
+        else:
+            plddt_array[pos_idx] = 50
+        
+        if ss_codes is not None and i < len(ss_codes):
+            ss_code = str(ss_codes[i]).strip().upper()
+            ss_array[pos_idx] = ss_map.get(ss_code, 0)
+        else:
+            ss_array[pos_idx] = 0
+    
+    x_positions = np.arange(1, total_length + 1)
+    
+    # === GENERATE SHAPES (rectangles) ===
     shapes = []
+    
+    # pLDDT rectangles (top half: 0.5-1.0)
+    for x_pos, val in zip(x_positions, plddt_array):
+        if val <= -5:
+            color = 'rgba(180, 180, 180, 0.5)'
+        elif val < 50:
+            color = 'rgba(255, 125, 69, 0.8)'
+        elif val < 70:
+            color = 'rgba(255, 219, 19, 0.8)'
+        elif val < 90:
+            color = 'rgba(101, 203, 243, 0.8)'
+        else:
+            color = 'rgba(0, 83, 214, 0.8)'
+        
+        shapes.append(dict(
+            type="rect", xref=f"x{row}", yref=f"y{row}",
+            x0=x_pos - 0.5, y0=0.5, x1=x_pos + 0.5, y1=1.0,
+            fillcolor=color, line=dict(width=0)
+        ))
+    
+    # SS rectangles (bottom half: 0.0-0.5)
+    ss_color_lookup = {
+        -1: 'rgba(180, 180, 180, 0.5)', 0: 'rgba(200, 200, 200, 0.5)',
+        1: 'rgba(255, 0, 0, 0.8)', 2: 'rgba(255, 100, 0, 0.8)',
+        3: 'rgba(255, 150, 150, 0.8)', 4: 'rgba(0, 0, 255, 0.8)',
+        5: 'rgba(100, 100, 255, 0.8)', 6: 'rgba(0, 200, 0, 0.8)',
+        7: 'rgba(200, 200, 0, 0.8)'
+    }
+    
+    for x_pos, val in zip(x_positions, ss_array):
+        color = ss_color_lookup.get(int(val), 'rgba(200, 200, 200, 0.5)')
+        shapes.append(dict(
+            type="rect", xref=f"x{row}", yref=f"y{row}",
+            x0=x_pos - 0.5, y0=0.0, x1=x_pos + 0.5, y1=0.5,
+            fillcolor=color, line=dict(width=0)
+        ))
+    
+    # === ANNOTATIONS (amino acids every 10 residues) ===
     annotations = []
-    
-    # Debug: check first few SS codes
-    if ss_codes is not None and len(ss_codes) > 0:
-        sample_ss = [str(ss_codes[i]).strip().upper() for i in range(min(10, len(ss_codes)))]
-        print(f"    First 10 SS codes: {sample_ss}")
-    
-    # Fill gaps BEFORE sequence start (if aligned to reference)
-    if reference_length > 0 and offset > 0:
-        print(f"    Filling gap at start: positions 1 to {offset}")
-        for pos in range(1, seq_start):
-            # Top row - gap
-            shapes.append(dict(
-                type="rect",
-                xref=f"x{row}", yref=f"y{row}",
-                x0=pos - 0.5, y0=0.5,
-                x1=pos + 0.5, y1=1.0,
-                fillcolor=gap_plddt_color,
-                line=dict(width=0.1, color='lightgray')
-            ))
-            # Bottom row - gap
-            shapes.append(dict(
-                type="rect",
-                xref=f"x{row}", yref=f"y{row}",
-                x0=pos - 0.5, y0=0.0,
-                x1=pos + 0.5, y1=0.5,
-                fillcolor=gap_ss_color,
-                line=dict(width=0.1, color='lightgray')
-            ))
-    
-    # Create rectangles for each residue in the sequence
     positions = np.arange(seq_start, seq_end + 1)
     for i, (pos, aa) in enumerate(zip(positions, sequence)):
-        # TOP ROW (0.5-1.0): pLDDT coloring
-        if plddt_values is not None and i < len(plddt_values):
-            plddt = plddt_values[i]
-            if plddt > 90:
-                plddt_color = 'rgba(0, 83, 214, 0.8)'  # Dark blue
-            elif plddt > 70:
-                plddt_color = 'rgba(101, 203, 243, 0.8)'  # Light blue
-            elif plddt > 50:
-                plddt_color = 'rgba(255, 219, 19, 0.8)'  # Yellow
-            else:
-                plddt_color = 'rgba(255, 125, 69, 0.8)'  # Orange
-        else:
-            plddt_color = 'rgba(200, 200, 200, 0.6)'  # Gray for reference
-        
-        shapes.append(dict(
-            type="rect",
-            xref=f"x{row}", yref=f"y{row}",
-            x0=pos - 0.5, y0=0.5,
-            x1=pos + 0.5, y1=1.0,
-            fillcolor=plddt_color,
-            line=dict(width=0.3, color='white')
-        ))
-        
-        # BOTTOM ROW (0.0-0.5): Secondary structure coloring
-        if ss_codes is not None and i < len(ss_codes):
-            ss = str(ss_codes[i]).strip().upper()
-            # Map common DSSP codes
-            if ss in ss_color_map:
-                ss_color = ss_color_map[ss]
-            else:
-                ss_color = ss_color_map['-']
-        else:
-            ss_color = 'rgba(200, 200, 200, 0.3)'
-        
-        shapes.append(dict(
-            type="rect",
-            xref=f"x{row}", yref=f"y{row}",
-            x0=pos - 0.5, y0=0.0,
-            x1=pos + 0.5, y1=0.5,
-            fillcolor=ss_color,
-            line=dict(width=0.3, color='white')
-        ))
-        
-        # Add amino acid letter every 10 residues
         if i % 10 == 0:
             annotations.append(dict(
-                x=pos, y=0.75,
-                xref=f"x{row}", yref=f"y{row}",
-                text=aa,
-                showarrow=False,
+                x=pos, y=0.75, xref=f"x{row}", yref=f"y{row}",
+                text=aa, showarrow=False,
                 font=dict(size=7, color='white', family='monospace')
             ))
     
-    # Fill gaps AFTER sequence end (if aligned to reference)
-    if reference_length > 0 and seq_end < reference_length:
-        print(f"    Filling gap at end: positions {seq_end + 1} to {reference_length}")
-        for pos in range(seq_end + 1, reference_length + 1):
-            # Top row - gap
-            shapes.append(dict(
-                type="rect",
-                xref=f"x{row}", yref=f"y{row}",
-                x0=pos - 0.5, y0=0.5,
-                x1=pos + 0.5, y1=1.0,
-                fillcolor=gap_plddt_color,
-                line=dict(width=0.1, color='lightgray')
-            ))
-            # Bottom row - gap
-            shapes.append(dict(
-                type="rect",
-                xref=f"x{row}", yref=f"y{row}",
-                x0=pos - 0.5, y0=0.0,
-                x1=pos + 0.5, y1=0.5,
-                fillcolor=gap_ss_color,
-                line=dict(width=0.1, color='lightgray')
-            ))
-    
-    # Mark consensus contact residues with vertical bars
-    # Only show if viewing range is zoomed in (< 200 residues visible)
+    # === CONSENSUS MARKERS ===
     if consensus_residues:
-        print(f"    🎯 Adding {len(consensus_residues)} consensus residue markers to row {row}")
-        print(f"    First 10 consensus positions: {consensus_residues[:10]}")
+        print(f"    🎯 Adding {len(consensus_residues)} consensus markers to row {row}")
         for res_num in consensus_residues:
-            # Add a thin vertical line at this position (more subtle)
             shapes.append(dict(
-                type="line",
-                xref=f"x{row}", yref=f"y{row}",
-                x0=res_num, y0=0.0,
-                x1=res_num, y1=1.0,
-                line=dict(color='rgba(255, 0, 255, 0.3)', width=1.5),  # More transparent, thinner
-                visible=True  # Will be visible by default, but subtle enough when zoomed out
+                type="line", xref=f"x{row}", yref=f"y{row}",
+                x0=res_num, y0=0.0, x1=res_num, y1=1.0,
+                line=dict(color='rgba(255, 0, 255, 0.4)', width=2)
             ))
-            # Add a small triangle marker at the bottom (only visible when zoomed)
             annotations.append(dict(
-                x=res_num, y=-0.1,
-                xref=f"x{row}", yref=f"y{row}",
-                text="▼",
-                showarrow=False,
-                font=dict(size=8, color='rgba(255, 0, 255, 0.5)')  # Smaller, more transparent
+                x=res_num, y=-0.05, xref=f"x{row}", yref=f"y{row}",
+                text="▼", showarrow=False,
+                font=dict(size=8, color='rgba(255, 0, 255, 0.6)')
             ))
     
-    # Add shapes and annotations
-    fig.update_layout(shapes=fig.layout.shapes + tuple(shapes))
-    fig.update_layout(annotations=fig.layout.annotations + tuple(annotations))
-    
-    # Add invisible trace for hover
+    # === HOVER DATA (scatter trace) ===
     hover_text = []
     for i, aa in enumerate(sequence):
         text_parts = [f"AA: {aa}", f"Pos: {int(positions[i])}"]
@@ -718,21 +721,50 @@ def add_sequence_track(fig, sequence, ss_codes, plddt_values, row, offset=0, ref
             text_parts.append(f"SS: {ss}")
         hover_text.append("<br>".join(text_parts))
     
-    fig.add_trace(
-        go.Scattergl(  # WebGL acceleration for better performance
-            x=positions,
-            y=[0.5] * len(positions),
-            mode='markers',
-            marker=dict(size=0.1, color='rgba(0,0,0,0)'),
-            showlegend=False,
-            hovertemplate='%{text}<extra></extra>',
-            text=hover_text
-        ),
-        row=row, col=1
+    trace = go.Scattergl(
+        x=positions, y=[0.5] * len(positions),
+        mode='markers', marker=dict(size=0.1, color='rgba(0,0,0,0)'),
+        showlegend=False, hovertemplate='%{text}<extra></extra>',
+        text=hover_text
     )
     
-    # Update axes
-    fig.update_xaxes(title_text="Residue Position", row=row, col=1)
-    fig.update_yaxes(showticklabels=False, range=[-0.1, 1.1], row=row, col=1)
+    print(f"  Track data generated: {len(shapes)} shapes + {len(annotations)} annotations")
     
-    print(f"  Track rendering complete: {len(shapes)} shapes created")
+    return {
+        'shapes': shapes,
+        'annotations': annotations,
+        'trace': trace,
+        'row': row
+    }
+
+
+def add_sequence_track(fig, sequence, ss_codes, plddt_values, row, offset=0, reference_length=0, max_span=0, consensus_residues=None):
+    """
+    Add a sequence track to the figure (wrapper for backward compatibility).
+    
+    This now just calls generate_sequence_track_data and adds results to figure.
+    """
+    track_data = generate_sequence_track_data(
+        sequence, ss_codes, plddt_values, row, offset,
+        reference_length, max_span, consensus_residues
+    )
+    
+    # Add shapes and annotations
+    if track_data['shapes']:
+        fig.update_layout(shapes=fig.layout.shapes + tuple(track_data['shapes']))
+    if track_data['annotations']:
+        fig.update_layout(annotations=fig.layout.annotations + tuple(track_data['annotations']))
+    
+    # Add trace
+    if track_data['trace']:
+        fig.add_trace(track_data['trace'], row=row, col=1)
+    
+    # Update axes
+    fig.update_xaxes(
+        title_text="Residue Position", row=row, col=1,
+        showticklabels=True, tickmode='auto'
+    )
+    fig.update_yaxes(
+        showticklabels=False, range=[-0.1, 1.1], row=row, col=1
+    )
+

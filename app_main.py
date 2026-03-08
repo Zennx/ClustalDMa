@@ -2701,10 +2701,24 @@ def server(input, output, session):
                     cluster_id
                 )
             
-            # Convert to HTML
-            html = fig.to_html(full_html=False, include_plotlyjs='require', div_id='sequence_alignment')
-            wrapped_html = f'<div style="width: 100%; height: 800px;">{html}</div>'
-            return ui.HTML(wrapped_html)
+            # Convert to HTML with explicit config
+            print(f"\n=== FIGURE DEBUG ===")
+            print(f"Number of traces: {len(fig.data)}")
+            print(f"Figure height: {fig.layout.height}")
+            print(f"Subplot rows: {len([d for d in fig.data if hasattr(d, 'xaxis')])}")
+            if len(fig.data) > 0:
+                print(f"First trace type: {type(fig.data[0]).__name__}")
+                print(f"First trace x sample: {fig.data[0].x[:5] if hasattr(fig.data[0], 'x') and len(fig.data[0].x) > 0 else 'N/A'}")
+            print(f"====================\n")
+            
+            # Return just the raw plotly div without extra wrapper
+            config = {'displayModeBar': True, 'displaylogo': False}
+            html = fig.to_html(
+                full_html=False, 
+                include_plotlyjs='cdn',
+                config=config
+            )
+            return ui.HTML(html)
             
         except Exception as e:
             import traceback
