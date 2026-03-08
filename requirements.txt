@@ -1,4 +1,4 @@
-# ClustalDM - Interactive HDOCK Clustering Analysis
+# ClustalDM - AlphaFold2 Model Clustering Analysis
 # Python package requirements
 
 # Core dependencies
@@ -9,6 +9,8 @@ scipy>=1.7.0
 scikit-learn>=1.7.0
 hdbscan>=0.8.0  # Hierarchical DBSCAN for better clustering
 seaborn>=0.13.2  # For enhanced visualizations
+biopython>=1.79  # For sequence alignment
+pydssp>=1.4.0  # For fast secondary structure calculation
 
 # Molecular dynamics
 MDAnalysis>=2.0.0
@@ -17,13 +19,11 @@ MDAnalysis>=2.0.0
 shiny>=0.6.0
 jinja2>=3.0.0
 
-# Phase 1: Advanced distance metrics
+# Advanced distance metrics
 mdtraj>=1.9.7
-freesasa>=2.1.0
 
 # Interactive visualization
 plotly>=5.0.0
-#py3Dmol>=2.0.0 deprecated - using molstar instead
 kaleido  # For plotly static image export
 molviewspec>=0.3.0  # Molstar state specification
 

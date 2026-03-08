@@ -1,11 +1,17 @@
 """
-Interactive visualization functions using Plotly and py3Dmol
+Interactive visualization functions using Plotly and Molstar
 """
 
 import os
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
+import json
+import base64
+import re
+from pathlib import Path
+import pandas as pd
+import plotly.figure_factory as ff
 #import py3Dmol
 from sklearn.decomposition import PCA
 from sklearn.manifold import MDS, TSNE
@@ -224,177 +230,13 @@ def create_hotspot_histogram(hotspots_df, top_n=None, smooth=True, split_by_chai
         return fig
 
 
-def create_mol_viewer_html(pdb_file, width=800, height=600, 
-                          protein_style='cartoon', protein_color='cyan',
-                          dna_style='stick', show_surface=True, 
-                          surface_opacity=0.5, zoom_level=1.0, color_by_sasa=False,
-                          sasa_min=0, sasa_max=100):
-    """
-    Create py3Dmol HTML for structure viewing with ligand-centered camera
-    
-    Parameters:
-    -----------
-    pdb_file : str
-        Path to PDB file
-    width : int
-        Viewer width in pixels
-    height : int
-        Viewer height in pixels
-    protein_style : str
-        Style for protein: 'cartoon', 'stick', 'sphere', 'line'
-    protein_color : str
-        Color for protein representation (or 'sasa' for ΔSASA coloring)
-    dna_style : str
-        Style for DNA: 'stick', 'sphere', 'line', 'cartoon'
-    show_surface : bool
-        Show protein surface
-    surface_opacity : float
-        Surface opacity (0-1)
-    zoom_level : float
-        Zoom multiplier (1.0 = default)
-    color_by_sasa : bool
-        If True, color protein by B-factor (ΔSASA values)
-    
-    Returns:
-    --------
-    str : HTML string for embedding
-    """
-    # Read PDB file
-    with open(pdb_file, 'r') as f:
-        pdb_data = f.read()
-    
-    # Create viewer
-    view = py3Dmol.view(width=width, height=height)
-    view.addModel(pdb_data, 'pdb')
-    
-    # Style protein
-    protein_sel = {'and': [{'not': {'resn': ['DA', 'DT', 'DG', 'DC', 'A', 'T', 'G', 'C', 'U']}}]}
-    
-    # Determine if we're using a colorscheme (chain, spectrum, etc.) vs solid color
-    using_colorscheme = False
-    show_sas_surface = False
-    
-    # Handle SASA/surface accessibility visualization
-    if color_by_sasa or protein_color == 'sasa':
-        # For SASA visualization, color by B-factor (which contains ΔSASA values)
-        # Use a gradient from blue (low/exposed) to red (high/buried)
-        show_sas_surface = True
-        using_colorscheme = False
-        
-        # Color protein by B-factor using gradient with dynamic range
-        # Note: Using 'rwb' (red-white-blue) gradient
-        # Blue (low) = exposed residues, Red (high) = buried residues
-        bfactor_style = {
-            'colorscheme': {
-                'prop': 'b',  # B-factor property
-                'gradient': 'rwb',  # Red-White-Blue gradient
-                'min': sasa_min,
-                'max': sasa_max
-            }
-        }
-        
-        if protein_style == 'cartoon':
-            view.setStyle(protein_sel, {'cartoon': bfactor_style})
-        elif protein_style == 'stick':
-            view.setStyle(protein_sel, {'stick': bfactor_style})
-        elif protein_style == 'sphere':
-            view.setStyle(protein_sel, {'sphere': bfactor_style})
-        elif protein_style == 'line':
-            view.setStyle(protein_sel, {'line': bfactor_style})
-        elif protein_style == 'surface':
-            view.setStyle(protein_sel, {'surface': bfactor_style})
-    elif protein_color == 'chain':
-        # Color by chain - use py3Dmol's built-in chain coloring
-        using_colorscheme = True
-        if protein_style == 'cartoon':
-            view.setStyle(protein_sel, {'cartoon': {'colorscheme': 'chain'}})
-        elif protein_style == 'stick':
-            view.setStyle(protein_sel, {'stick': {'colorscheme': 'chain'}})
-        elif protein_style == 'sphere':
-            view.setStyle(protein_sel, {'sphere': {'colorscheme': 'chain'}})
-        elif protein_style == 'line':
-            view.setStyle(protein_sel, {'line': {'colorscheme': 'chain'}})
-    else:
-        # Use solid color
-        if protein_style == 'cartoon':
-            view.setStyle(protein_sel, {'cartoon': {'color': protein_color}})
-        elif protein_style == 'stick':
-            view.setStyle(protein_sel, {'stick': {'color': protein_color}})
-        elif protein_style == 'sphere':
-            view.setStyle(protein_sel, {'sphere': {'color': protein_color}})
-        elif protein_style == 'line':
-            view.setStyle(protein_sel, {'line': {'color': protein_color}})
-    
-    # Add SAS surface for solvent accessibility visualization
-    if show_sas_surface:
-        # Add surface colored by B-factor (ΔSASA values) with dynamic range
-        view.addSurface(py3Dmol.VDW, {
-            'opacity': 0.85,
-            'colorscheme': {
-                'prop': 'b',  # B-factor property
-                'gradient': 'rwb',  # Red-White-Blue gradient
-                'min': sasa_min,
-                'max': sasa_max
-            }
-        }, protein_sel)
-    
-    # Add regular surface if requested (and not showing SAS)
-    elif show_surface:
-        if protein_style == 'cartoon' and using_colorscheme:
-            # Use semi-transparent white surface for cartoon+colorscheme
-            # This lets the cartoon ribbons with their colors show through
-            view.addSurface(py3Dmol.VDW, {'opacity': surface_opacity, 'color': 'white'}, protein_sel)
-        elif protein_color == 'chain':
-            # For chain coloring (non-cartoon), we can't color surface by chain in py3Dmol
-            # So use white transparent surface to avoid confusion
-            view.addSurface(py3Dmol.VDW, {'opacity': surface_opacity, 'color': 'white'}, protein_sel)
-        else:
-            # For solid colors, match the protein color
-            view.addSurface(py3Dmol.VDW, {'opacity': surface_opacity, 'color': protein_color}, protein_sel)
-    
-    # Style DNA/RNA
-    dna_sel = {'resn': ['DA', 'DT', 'DG', 'DC', 'A', 'T', 'G', 'C', 'U']}
-    
-    if dna_style == 'stick':
-        view.setStyle(dna_sel, {'stick': {'radius': 0.3, 'colorscheme': 'nucleicAcidColorscheme'}})
-    elif dna_style == 'sphere':
-        view.setStyle(dna_sel, {'sphere': {'colorscheme': 'nucleicAcidColorscheme'}})
-    elif dna_style == 'line':
-        view.setStyle(dna_sel, {'line': {'colorscheme': 'nucleicAcidColorscheme'}})
-    elif dna_style == 'cartoon':
-        view.setStyle(dna_sel, {'cartoon': {'colorscheme': 'nucleicAcidColorscheme'}})
-    
-    # Center view on nucleic acid (ligand) with zoom level
-    view.zoomTo(dna_sel, zoom_level * 1.0)
-    
-    # Enable hover labels to show residue information
-    view.setHoverable({}, True, 
-                      '''function(atom,viewer,event,container) {
-                          if(!atom.label) {
-                              atom.label = viewer.addLabel(atom.resn + " " + atom.resi + " (" + atom.chain + ")",
-                                  {position: atom, backgroundColor: 'mintcream', fontColor:'black'});
-                          }
-                      }''',
-                      '''function(atom,viewer) { 
-                          if(atom.label) {
-                              viewer.removeLabel(atom.label);
-                              delete atom.label;
-                          }
-                      }''')
-    
-    # Don't set background - let it be transparent, CSS will handle it
-    # (py3Dmol will use default which we can override with CSS)
-    
-    return view._make_html()
-
-
 def create_molstar_viewer_html(pdb_file, width=800, height=600, 
                                protein_style='surface', protein_color='cyan',
                                dna_style='stick', show_surface=True, 
-                               surface_opacity=0.5, zoom_level=1.0, color_by_sasa=False,
-                               sasa_min=0, sasa_max=100, protein_chains=None, nucleic_chains=None):
+                               surface_opacity=0.5, zoom_level=1.0, 
+                               protein_chains=None, nucleic_chains=None):
     """
-    Create Molstar HTML for structure viewing with custom SASA preset
+    Create Molstar HTML for structure viewing
     Uses molviewspec Python library for proper state generation
     
     Parameters:
@@ -408,7 +250,7 @@ def create_molstar_viewer_html(pdb_file, width=800, height=600,
     protein_style : str
         Style for protein: 'cartoon', 'stick', 'sphere', 'line'
     protein_color : str
-        Color for protein representation (or 'sasa' for ΔSASA coloring)
+        Color for protein representation
     dna_style : str
         Style for DNA: 'stick', 'sphere', 'line', 'cartoon'
     show_surface : bool
@@ -417,12 +259,6 @@ def create_molstar_viewer_html(pdb_file, width=800, height=600,
         Surface opacity (0-1)
     zoom_level : float
         Zoom multiplier (1.0 = default)
-    color_by_sasa : bool
-        If True, color protein by B-factor (ΔSASA values)
-    sasa_min : float
-        Minimum SASA value for color scale
-    sasa_max : float
-        Maximum SASA value for color scale
     protein_chains : list, optional
         List of chain IDs that are protein (e.g., ['A', 'B'])
     nucleic_chains : list, optional
@@ -441,90 +277,8 @@ def create_molstar_viewer_html(pdb_file, width=800, height=600,
         pdb_data = f.read()
     pdb_base64 = base64.b64encode(pdb_data.encode()).decode()
     
-    # Build Molstar state manually with proper selectors
-    print(f"Building Molstar state: surface={show_surface}, sasa={color_by_sasa}, chains(protein={protein_chains}, nucleic={nucleic_chains})")
+    print(f"Building Molstar viewer: cartoon with pLDDT coloring")
     
-    # Build chain-based selectors if chains are provided, otherwise use entity types
-    if protein_chains:
-        protein_selector = {"chain-test": {"auth_asym_id": {"$in": protein_chains}}}
-    else:
-        # Default: select all polymer entities (will be protein-like)
-        protein_selector = "protein"
-    
-    if nucleic_chains:
-        nucleic_selector = {"chain-test": {"auth_asym_id": {"$in": nucleic_chains}}}
-    else:
-        nucleic_selector = "nucleic"
-    
-    # Build protein representation
-    protein_repr_type = "molecular-surface" if show_surface else "surface"
-    protein_color_theme = "uncertainty" if color_by_sasa else "chain-id"
-    
-    # Build typeParams for representation (opacity goes here for surfaces)
-    protein_type_params = {}
-    if show_surface:
-        protein_type_params["alpha"] = surface_opacity
-    
-    # Build color params (min/max for SASA)
-    protein_color_params = {}
-    if color_by_sasa:
-        protein_color_params["min"] = sasa_min
-        protein_color_params["max"] = sasa_max
-    
-    mvsj_state = {
-        "root": {
-            "kind": "root",
-            "children": [
-                {
-                    "kind": "structure",
-                    "params": {
-                        "url": f"data:text/plain;base64,{pdb_base64}",
-                        "format": "pdb"
-                    },
-                    "children": [
-                        {
-                            "kind": "component",
-                            "params": {"selector": protein_selector},
-                            "children": [
-                                {
-                                    "kind": "representation",
-                                    "params": {
-                                        "type": protein_repr_type,
-                                        "typeParams": protein_type_params,
-                                        "color": {
-                                            "name": protein_color_theme,
-                                            "params": protein_color_params
-                                        }
-                                    }
-                                }
-                            ]
-                        },
-                        {
-                            "kind": "component",
-                            "params": {"selector": nucleic_selector},
-                            "children": [
-                                {
-                                    "kind": "representation",
-                                    "params": {
-                                        "type": "ball-and-stick",
-                                        "typeParams": {"sizeFactor": 0.3},
-                                        "color": {
-                                            "name": "element-symbol",
-                                            "params": {}
-                                        }
-                                    }
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ]
-        }
-    }
-    
-    print(f"✓ Generated Molstar state (protein: {protein_repr_type}, nucleic: ball-and-stick)")
-    
-    mvsj_json = json.dumps(mvsj_state)
     
     # Build HTML with Molstar and custom preset
     html_template = f'''
@@ -532,7 +286,7 @@ def create_molstar_viewer_html(pdb_file, width=800, height=600,
 <html>
 <head>
     <meta charset="utf-8" />
-    <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/molstar@3.42.0/build/viewer/molstar.css" />
+    <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/molstar@latest/build/viewer/molstar.css" />
     <style>
         /* Dark mode override for Molstar */
         @media (prefers-color-scheme: dark) {{
@@ -557,7 +311,7 @@ def create_molstar_viewer_html(pdb_file, width=800, height=600,
 <body>
     <div id="molstar-container"></div>
     
-    <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/molstar@3.42.0/build/viewer/molstar.js"></script>
+    <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/molstar@latest/build/viewer/molstar.js"></script>
     <script type="text/javascript">
         // Wait for both DOM and Molstar to load
         function initMolstar() {{
@@ -648,36 +402,18 @@ def create_molstar_viewer_html(pdb_file, width=800, height=600,
                 if (proteinComp) {{
                     console.log('✓ Protein component created');
                     
-                    const useSASA = {str(color_by_sasa).lower()};
-                    const showSurface = {str(show_surface).lower()};
-                    
-                    // Always add cartoon representation
-                    console.log('Adding protein surface representation, SASA=' + useSASA);
+                    // Add cartoon with uncertainty coloring (pLDDT)
+                    // Following MolStar's pLDDT colouring, same as AlphaFold server/ AlphaFoldDB
                     await actualPlugin.builders.structure.representation.addRepresentation(
                         proteinComp,
                         {{
-                            type: 'molecular-surface',
+                            type: 'cartoon',
                             typeParams: {{}},
-                            color: useSASA ? 'uncertainty' : 'chain-id',
-                            colorParams: useSASA ? {{ min: {sasa_min}, max: {sasa_max} }} : {{}}
-                        }}
+                            color: 'plddt-confidence'
+                        }}  
+
                     );
-                    console.log('✓ Cartoon representation added');
-                    
-                    // Add molecular surface if requested
-                    if (showSurface) {{
-                        console.log('Adding protein molecular-surface representation, SASA=' + useSASA);
-                        await actualPlugin.builders.structure.representation.addRepresentation(
-                            proteinComp,
-                            {{
-                                type: 'molecular-surface',
-                                typeParams: {{ alpha: {surface_opacity} }},
-                                color: useSASA ? 'uncertainty' : 'chain-id',
-                                colorParams: useSASA ? {{ min: {sasa_min}, max: {sasa_max} }} : {{}}
-                            }}
-                        );
-                        console.log('✓ Molecular surface representation added');
-                    }}
+                    console.log('✓ Cartoon representation added with (pLDDT) coloring');
                 }} else {{
                     console.error('✗ Failed to create protein component');
                 }}
@@ -2456,7 +2192,8 @@ def create_hdbscan_condensed_tree(clusterer, labels=None, labels_for_tree=None, 
         
         fig_mpl, ax = plt.subplots(1, 1, figsize=(14, 8))
         actual_clusterer.condensed_tree_.plot(
-            select_clusters=False,  # Tree-only (no ellipses due to matplotlib bug)
+            select_clusters=True,
+            selection_palette=sns.color_palette('deep'),
             axis=ax,
             log_size=True,  # Use log scale for cluster size
             cmap='viridis'

@@ -30,13 +30,16 @@ except ImportError as e:
 # Import modular components
 try:
     from core import PDBClusterer, find_pdb_files, InterfaceAnalyzer
-    from core.hdock_parser_docker import HDOCKParser
     from visualization import (
         create_scatter_multimethod,
         create_hotspot_histogram,
         create_molstar_viewer_html as create_mol_viewer_html,  # Use Molstar instead of py3Dmol
         create_distance_heatmap,
         create_cluster_size_distribution,
+    )
+    from visualization.sequence_alignment import (
+        create_alignment_visualization_medoids,
+        create_alignment_visualization_within_cluster
     )
     print("✓ Core and visualization modules loaded (using Molstar)")
 except ImportError as e:
@@ -533,7 +536,7 @@ app_ui = ui.page_fluid(
     ),
     # Header with title, theme toggle, and download
     ui.div(
-        ui.h1("🧬 ClustalDM - Interactive Clustering Analysis", style="display: inline-block; margin: 20px;"),
+        ui.h1("🧬 ClustalDMɑ - AlphaFold2 Model Clustering", style="display: inline-block; margin: 20px;"),
         ui.download_button("download_all", "📥 Download Results", class_="btn btn-sm btn-success", style="margin-right: 10px;"),
         ui.input_action_button("theme_toggle", "🌙 Dark", class_="btn btn-sm btn-outline-secondary"),
         style="position: relative;"
@@ -541,53 +544,44 @@ app_ui = ui.page_fluid(
     
     ui.layout_sidebar(
         ui.sidebar(
-            ui.h4("Upload HDOCK Results"),
+            ui.h4("Upload AlphaFold2 Models"),
             ui.div(
-                ui.input_file("hdock_out_files", "1. HDOCK Output (.out):", 
-                             multiple=True,
-                             accept=[".out"]),
-                ui.tags.small("Upload one or more HDOCK .out files", 
+                ui.input_text("af2_directory", "📁 AlphaFold2 Model Directory:",
+                             value="",
+                             placeholder="/path/to/alphafold/models"),
+                ui.tags.small("Paste directory path containing PDB/CIF files (searches subdirectories automatically)", 
                              style="color: #6c757d; display: block; margin-top: 5px; margin-bottom: 15px;"),
                 style="margin-bottom: 10px;"
             ),
             ui.div(
-                ui.input_file("receptor_pdb", "2. Receptor PDB:", 
-                             accept=[".pdb"]),
-                ui.tags.small("Upload receptor structure (protein/DNA)", 
-                             style="color: #6c757d; display: block; margin-top: 5px; margin-bottom: 15px;"),
+                ui.input_file("reference_model", "Reference Model (optional):", 
+                             accept=[".pdb", ".cif"]),
+                ui.tags.small("Upload reference structure for superposition/RMSD calculation", 
+                             style="color: #6c757d; display: block; margin-top: 5px; margin-bottom: 10px;"),
                 style="margin-bottom: 10px;"
             ),
             ui.div(
-                ui.input_file("ligand_pdb", "3. Ligand PDB:", 
-                             accept=[".pdb"]),
-                ui.tags.small("Upload ligand structure (protein/DNA/RNA)", 
+                ui.input_file("reference_sequence", "Reference Sequence (optional):", 
+                             accept=[".fasta", ".fa", ".txt", ".pdb"]),
+                ui.tags.small("Upload reference FASTA or PDB for residue number validation/correction (recommended for chopped AlphaFold models)", 
                              style="color: #6c757d; display: block; margin-top: 5px; margin-bottom: 10px;"),
                 style="margin-bottom: 10px;"
             ),
             ui.output_ui("upload_status"),
             ui.hr(),
             ui.h5("Analysis Options"),
+            ui.input_text("ligand_chain", "Ligand Chain ID:", 
+                         value="B",
+                         placeholder="e.g., B or C"),
+            ui.tags.small("Chain ID of the ligand/partner molecule (default: B)", 
+                         style="color: #6c757d; display: block; margin-top: -5px; margin-bottom: 10px;"),
             ui.input_text("motif_residues", "Motif Residues (optional):", 
                          value="",
                          placeholder="e.g., A:10-20,B:30-35"),
             ui.tags.small("Format: Chain:Start-End, comma-separated", 
                          style="color: #6c757d; display: block; margin-top: -5px; margin-bottom: 5px;"),
-            ui.input_radio_buttons(
-                "sasa_mode",
-                "ΔSASA Calculation:",
-                choices={
-                    "combined": "Combined (Total Interface)",
-                    "split": "Split by Chains"
-                },
-                selected="combined"
-            ),
-            ui.tags.small("Atomic-level calculation with 1.4 Å probe radius (water molecule). Split mode requires motif residues. Negative ΔSASA indicates conformational changes or cavities.", 
-                         style="color: #6c757d; display: block; margin-top: -5px; margin-bottom: 10px;"),
-            ui.hr(),
-            ui.h5("Pose Extraction"),
-            ui.input_slider("max_poses", "Max Poses per File:", 
-                           min=10, max=4392, value=100, step=10),
-            ui.tags.small("Limit poses extracted from each HDOCK output file (lower = faster testing)", 
+            ui.input_checkbox("apply_residue_offset", "Apply Residue Number Corrections", value=False),
+            ui.tags.small("Enable for 'chopped' AlphaFold models (extracts offset from filename/alignment)", 
                          style="color: #6c757d; display: block; margin-top: -5px; margin-bottom: 10px;"),
             ui.hr(),
             ui.h5("Clustering (HDBSCAN)"),
@@ -597,11 +591,7 @@ app_ui = ui.page_fluid(
                            min=1, max=10, value=2, step=1),
             ui.input_checkbox("filter_duplicates", "Filter Near-Duplicates", value=True),
             ui.tags.small("Remove very similar structures before clustering (faster, cleaner trees)", 
-                         style="color: #6c757d; display: block; margin-top: -5px; margin-bottom: 5px;"),
-            ui.input_numeric("duplicate_threshold", "Duplicate Threshold:", 
-                           value=0.0001, min=0.00001, max=0.1, step=0.0001),
-            ui.tags.small("HDBSCAN automatically finds optimal clustering without eps parameter", 
-                         style="color: #6c757d; display: block; margin-top: 5px; margin-bottom: 10px;"),
+                         style="color: #6c757d; display: block; margin-top: -5px; margin-bottom: 10px;"),
             ui.hr(),
             ui.input_action_button("run_clustering", "🚀 Run Analysis", class_="btn-primary"),
             ui.input_action_button("recluster", "🔄 Re-Cluster (fast)", class_="btn-secondary", 
@@ -681,7 +671,7 @@ app_ui = ui.page_fluid(
                     - Each point = one pose  
                     - X-axis: RMSD from cluster medoid (Å)  
                     - Y-axis: Cluster (sorted by size)  
-                    - Color: ΔSASA (buried surface area)
+                    - Color: By cluster assignment
                     """),
                     ui.output_ui("cluster_diversity_plot")
                 ),
@@ -829,6 +819,44 @@ app_ui = ui.page_fluid(
                 )
             ),
             ui.nav_panel(
+                "🧬 Sequence QC",
+                ui.card(
+                    ui.card_header("Sequence Alignment Quality Control"),
+                    ui.markdown("""
+                        **Visualize secondary structure and pLDDT confidence for:**
+                        - **Medoid Comparison**: Compare secondary structure across cluster medoids
+                        - **Within Cluster**: Examine all structures within a single cluster
+                        
+                        *Colour Key*  
+                        *pLDDT score*: Dark blue (>90), Light blue (70-90), Yellow (50-70), Orange (<50)  
+                        *Secondary Structure*:  
+                            α-helix (H, red), 3-10 helix (G, orange), π-helix (I, pink),  
+                            β-sheet (E, blue), β-bridge (B, light blue),  
+                            Turn (T, green), Bend (S, yellow), Coil/Undefined (-, gray).  
+                    """),
+                    ui.input_radio_buttons(
+                        "sequence_viz_mode",
+                        "Visualization Mode:",
+                        choices={
+                            "medoids": "Medoid Comparison (across clusters)",
+                            "within": "Within Cluster (all structures)"
+                        },
+                        selected="medoids",
+                        inline=True
+                    ),
+                    ui.panel_conditional(
+                        "input.sequence_viz_mode === 'within'",
+                        ui.input_select(
+                            "sequence_viz_cluster",
+                            "Select Cluster:",
+                            choices={},
+                            width="300px"
+                        )
+                    ),
+                    ui.output_ui("sequence_alignment_plot")
+                )
+            ),
+            ui.nav_panel(
                 "📋 Structure Details",
                 ui.card(
                     ui.card_header("Interface statistics for all structures"),
@@ -889,108 +917,6 @@ app_ui = ui.page_fluid(
 # Helper function for parallel SASA computation (must be at module level for pickling)
 # ============================================================================
 
-def _compute_sasa_worker(args):
-    """Worker function for parallel SASA computation (module-level for pickling)"""
-    idx, pdb_file, contact_pairs, split_mode_val, motif_dict_val, protein_pdb_path, nucleic_pdb_path = args
-    
-    # Import here to ensure each process has the module
-    from core.analysis import InterfaceAnalyzer
-    import os
-    import numpy as np
-    import freesasa
-    
-    try:
-        # Get protein and nucleic chains from contact data
-        contacts = contact_pairs[idx]
-        protein_chains = set()
-        nucleic_chains = set()
-        
-        for contact in contacts:
-            prot_res = contact['protein_residue']
-            nuc_res = contact['nucleic_residue']
-            
-            if ':' in prot_res:
-                protein_chains.add(prot_res.split(':')[0])
-            if ':' in nuc_res:
-                nucleic_chains.add(nuc_res.split(':')[0])
-        
-        # Compute reference SASA in this worker (freesasa objects can't be pickled)
-        precomputed_protein = None
-        precomputed_nucleic = None
-        precomputed_pdbs = None
-        
-        if protein_pdb_path and nucleic_pdb_path:
-            freesasa.setVerbosity(freesasa.silent)
-            params = freesasa.Parameters()
-            params.setProbeRadius(1.4)
-            
-            structure_protein = freesasa.Structure(protein_pdb_path)
-            result_protein = freesasa.calc(structure_protein, params)
-            sasa_protein = result_protein.totalArea()
-            
-            structure_nucleic = freesasa.Structure(nucleic_pdb_path)
-            result_nucleic = freesasa.calc(structure_nucleic, params)
-            sasa_nucleic = result_nucleic.totalArea()
-            
-            precomputed_protein = {
-                'sasa': sasa_protein,
-                'structure': structure_protein,
-                'result': result_protein
-            }
-            precomputed_nucleic = {
-                'sasa': sasa_nucleic,
-                'structure': structure_nucleic,
-                'result': result_nucleic
-            }
-            precomputed_pdbs = {
-                'protein_pdb': protein_pdb_path,
-                'nucleic_pdb': nucleic_pdb_path
-            }
-        
-        # Calculate ΔSASA
-        sasa_result = InterfaceAnalyzer.calculate_delta_sasa(
-            pdb_file,
-            list(protein_chains),
-            list(nucleic_chains),
-            motif_residues=motif_dict_val,
-            split_by_chain=split_mode_val,
-            precomputed_protein_sasa=precomputed_protein,
-            precomputed_nucleic_sasa=precomputed_nucleic,
-            precomputed_structures=precomputed_pdbs
-        )
-        
-        result_dict = {
-            'structure': os.path.basename(pdb_file),
-            'total_delta_sasa': sasa_result['total_delta_sasa'],
-            'motif_delta_sasa': sasa_result.get('motif_delta_sasa'),
-            'motif_sasa_protein': sasa_result.get('motif_sasa_protein'),
-            'sasa_complex': sasa_result['sasa_complex'],
-            'sasa_protein': sasa_result['sasa_protein'],
-            'sasa_nucleic': sasa_result['sasa_nucleic']
-        }
-        
-        # Add per-chain ΔSASA if in split mode
-        if split_mode_val and 'chain_sasa' in sasa_result:
-            for chain_id, chain_sasa_val in sasa_result['chain_sasa'].items():
-                result_dict[f'chain_{chain_id}_sasa'] = chain_sasa_val
-        
-        return result_dict
-        
-    except Exception as e:
-        import traceback
-        error_detail = f"{type(e).__name__}: {str(e)}"
-        return {
-            'structure': os.path.basename(pdb_file),
-            'total_delta_sasa': np.nan,
-            'motif_delta_sasa': np.nan,
-            'motif_sasa_protein': np.nan,
-            'sasa_complex': np.nan,
-            'sasa_protein': np.nan,
-            'sasa_nucleic': np.nan,
-            'error': error_detail
-        }
-
-
 # ============================================================================
 # Server Logic
 # ============================================================================
@@ -1004,19 +930,16 @@ def server(input, output, session):
     cluster_summary = reactive.Value(None)
     rmsd_stats = reactive.Value(None)
     rmsd_matrix = reactive.Value(None)
-    sasa_data = reactive.Value(None)  # ΔSASA results
-    current_motif = reactive.Value(None)  # Store motif for SASA visualization
+    current_motif = reactive.Value(None)  # Store motif for visualization
     analysis_complete = reactive.Value(False)  # Track if analysis is done
     status_log = reactive.Value([])  # Terminal-style output log
     current_theme = reactive.Value('dark')  # Track current theme
     
-    # Upload-specific reactive values
-    temp_dir = reactive.Value(None)  # Temporary directory for uploaded files
-    uploaded_files = reactive.Value([])  # List of uploaded .out files
-    receptor_pdb_file = reactive.Value(None)  # Uploaded receptor PDB
-    ligand_pdb_file = reactive.Value(None)  # Uploaded ligand PDB
-    parsed_pdbs = reactive.Value([])  # List of generated PDB files
-    auto_run_trigger = reactive.Value(0)  # Trigger for auto-run (increment to trigger)
+    # AlphaFold2-specific reactive values
+    af2_models_dir = reactive.Value(None)  # Directory containing AF2 models
+    reference_model_file = reactive.Value(None)  # Optional reference model for RMSD
+    reference_sequence_file = reactive.Value(None)  # Optional reference FASTA for residue correction
+    af2_model_files = reactive.Value([])  # List of found AF2 model files
     
     def log_status(message):
         """Add message to status log"""
@@ -1028,205 +951,140 @@ def server(input, output, session):
     @render.ui
     def upload_status():
         """Show upload status"""
-        out_files = uploaded_files.get()
-        receptor = receptor_pdb_file.get()
-        ligand = ligand_pdb_file.get()
-        pdbs = parsed_pdbs.get()
+        models_dir = af2_models_dir.get()
+        ref_model = reference_model_file.get()
+        model_files = af2_model_files.get()
         
         status_items = []
         
-        # Check uploads
-        if out_files:
-            status_items.append(ui.tags.li(f"✓ {len(out_files)} HDOCK .out file(s)", style="color: #28a745;"))
+        # Check directory input
+        if models_dir and os.path.isdir(models_dir):
+            status_items.append(ui.tags.li(f"✓ Models directory: {models_dir}", style="color: #28a745;"))
+            if model_files:
+                status_items.append(ui.tags.li(f"✓ Found {len(model_files)} AlphaFold2 model(s)", style="color: #28a745;"))
+            else:
+                status_items.append(ui.tags.li("⚠ No PDB/mmCIF files found in directory", style="color: #ffc107;"))
         else:
-            status_items.append(ui.tags.li("⚠ No .out files uploaded", style="color: #6c757d;"))
+            status_items.append(ui.tags.li("⚠ No models directory specified", style="color: #6c757d;"))
         
-        if receptor:
-            status_items.append(ui.tags.li("✓ Receptor PDB", style="color: #28a745;"))
+        if ref_model:
+            status_items.append(ui.tags.li("✓ Reference model uploaded", style="color: #28a745;"))
         else:
-            status_items.append(ui.tags.li("⚠ No receptor PDB", style="color: #6c757d;"))
-        
-        if ligand:
-            status_items.append(ui.tags.li("✓ Ligand PDB", style="color: #28a745;"))
-        else:
-            status_items.append(ui.tags.li("⚠ No ligand PDB", style="color: #6c757d;"))
+            status_items.append(ui.tags.li("ℹ Optional: Reference model for RMSD", style="color: #6c757d;"))
         
         # Show ready status
-        if out_files and receptor and ligand:
-            if pdbs:
-                status_items.append(ui.tags.li(f"✓ {len(pdbs)} poses generated - Ready for analysis!", 
-                                              style="color: #007bff; font-weight: bold;"))
-            else:
-                status_items.append(ui.tags.li("👉 Ready! Click 'Start Analysis' to extract ALL poses and cluster", 
-                                              style="color: #007bff; font-weight: bold;"))
+        if models_dir and model_files:
+            status_items.append(ui.tags.li(f"👉 Ready! Click 'Start Analysis' to cluster {len(model_files)} models", 
+                                          style="color: #007bff; font-weight: bold;"))
         
         return ui.tags.ul(*status_items, style="list-style: none; padding-left: 0;")
     
     @reactive.effect
-    @reactive.event(input.hdock_out_files)
-    def handle_out_upload():
-        """Handle HDOCK .out file uploads"""
-        files_info = input.hdock_out_files()
-        if not files_info:
+    @reactive.event(input.af2_directory)
+    def handle_directory_change():
+        """Handle AF2 directory input change"""
+        directory = input.af2_directory().strip()
+        if not directory:
+            af2_models_dir.set(None)
+            af2_model_files.set([])
+            return
+        
+        # Expand ~ to home directory
+        directory = os.path.expanduser(directory)
+        
+        if not os.path.isdir(directory):
+            log_status(f"⚠ Not a valid directory: {directory}")
+            af2_models_dir.set(None)
+            af2_model_files.set([])
             return
         
         try:
-            # Create temporary directory if it doesn't exist
-            if temp_dir.get() is None:
-                tmp = tempfile.mkdtemp(prefix="clustaldm_")
-                temp_dir.set(tmp)
-                log_status(f"Created temp directory: {tmp}")
+            # Find all PDB and mmCIF files recursively
+            log_status(f"Scanning {directory} and subdirectories...")
+            model_files = find_pdb_files(directory)
             
-            tmp = temp_dir.get()
-            out_files = []
-            
-            for file_info in files_info:
-                file_path = os.path.join(tmp, file_info['name'])
-                shutil.copy(file_info['datapath'], file_path)
-                out_files.append(file_path)
-                log_status(f"Uploaded .out: {file_info['name']}")
-            
-            uploaded_files.set(out_files)
-            # Clear any previous generated PDBs
-            parsed_pdbs.set([])
-            
-            ui.notification_show(
-                f"✓ Uploaded {len(out_files)} HDOCK .out file(s)",
-                type="success",
-                duration=3
-            )
-            
-        except Exception as e:
-            log_status(f"Upload error: {str(e)}")
-            ui.notification_show(f"Upload failed: {str(e)}", type="error", duration=5)
-    
-    @reactive.effect
-    @reactive.event(input.receptor_pdb)
-    def handle_receptor_upload():
-        """Handle receptor PDB upload"""
-        file_info = input.receptor_pdb()
-        if not file_info:
-            return
-        
-        try:
-            if temp_dir.get() is None:
-                tmp = tempfile.mkdtemp(prefix="clustaldm_")
-                temp_dir.set(tmp)
-            
-            tmp = temp_dir.get()
-            # Save with a standard name
-            receptor_path = os.path.join(tmp, "receptor.pdb")
-            shutil.copy(file_info[0]['datapath'], receptor_path)
-            receptor_pdb_file.set(receptor_path)
-            log_status(f"Uploaded receptor: {file_info[0]['name']}")
-            
-            ui.notification_show(
-                f"✓ Receptor PDB uploaded: {file_info[0]['name']}",
-                type="success",
-                duration=3
-            )
-            
-        except Exception as e:
-            log_status(f"Receptor upload error: {str(e)}")
-            ui.notification_show(f"Receptor upload failed: {str(e)}", type="error", duration=5)
-    
-    @reactive.effect
-    @reactive.event(input.ligand_pdb)
-    def handle_ligand_upload():
-        """Handle ligand PDB upload"""
-        file_info = input.ligand_pdb()
-        if not file_info:
-            return
-        
-        try:
-            if temp_dir.get() is None:
-                tmp = tempfile.mkdtemp(prefix="clustaldm_")
-                temp_dir.set(tmp)
-            
-            tmp = temp_dir.get()
-            # Save with a standard name
-            ligand_path = os.path.join(tmp, "ligand.pdb")
-            shutil.copy(file_info[0]['datapath'], ligand_path)
-            ligand_pdb_file.set(ligand_path)
-            log_status(f"Uploaded ligand: {file_info[0]['name']}")
-            
-            ui.notification_show(
-                f"✓ Ligand PDB uploaded: {file_info[0]['name']}",
-                type="success",
-                duration=3
-            )
-            
-        except Exception as e:
-            log_status(f"Ligand upload error: {str(e)}")
-            ui.notification_show(f"Ligand upload failed: {str(e)}", type="error", duration=5)
-    
-    @reactive.effect
-    def auto_run_validation():
-        """Auto-run analysis when all three files are uploaded and validated"""
-        # Watch the reactive values
-        out_files = uploaded_files.get()
-        receptor = receptor_pdb_file.get()
-        ligand = ligand_pdb_file.get()
-        
-        # Check if all files are uploaded
-        if not out_files or not receptor or not ligand:
-            return  # Not ready yet
-        
-        # Check if analysis is already running/complete to avoid re-triggering
-        if analysis_complete.get():
-            return
-        
-        # Extract job IDs from filenames to validate they match
-        def extract_job_id(filepath):
-            """Extract HDOCK job ID from filename (e.g., hdock_69083e48ce879.out -> 69083e48ce879)"""
-            import re
-            basename = os.path.basename(filepath)
-            # Match pattern: hdock_JOBID or rec_JOBID or lig_JOBID
-            match = re.search(r'(?:hdock|rec|lig)_([a-f0-9]+)', basename)
-            return match.group(1) if match else None
-        
-        # Get job IDs
-        out_job_ids = set()
-        for out_file in out_files:
-            job_id = extract_job_id(out_file)
-            if job_id:
-                out_job_ids.add(job_id)
-        
-        receptor_job_id = extract_job_id(receptor)
-        ligand_job_id = extract_job_id(ligand)
-        
-        # Validate all files are from the same job
-        if receptor_job_id and ligand_job_id and out_job_ids:
-            # Check if receptor and ligand have the same job ID
-            if receptor_job_id == ligand_job_id:
-                # Check if at least one .out file matches
-                if receptor_job_id in out_job_ids:
-                    log_status("")
-                    log_status("✓ All files validated: Same HDOCK job ID detected")
-                    log_status(f"  Job ID: {receptor_job_id}")
-                    log_status("🚀 Auto-starting analysis...")
-                    ui.notification_show(
-                        "✓ Files validated! Auto-starting analysis...",
-                        type="success",
-                        duration=3
-                    )
-                    # Trigger analysis by incrementing the trigger value
-                    # This will fire the run_analysis reactive effect
-                    auto_run_trigger.set(auto_run_trigger.get() + 1)
-                else:
-                    log_status("⚠ Warning: .out file job ID doesn't match receptor/ligand")
-                    ui.notification_show(
-                        "⚠️ Job ID mismatch. Click 'Run Analysis' manually if files are correct.",
-                        type="warning",
-                        duration=5
-                    )
-            else:
-                log_status("⚠ Warning: Receptor and ligand have different job IDs")
+            if model_files:
+                af2_models_dir.set(directory)
+                af2_model_files.set(model_files)
+                log_status(f"✓ Found {len(model_files)} AlphaFold2 models in {directory} (including subdirectories)")
                 ui.notification_show(
-                    "⚠️ Receptor and ligand may be from different jobs. Verify before running.",
-                    type="warning",
-                    duration=5
+                    f"✓ Found {len(model_files)} model file(s)",
+                    type="success",
+                    duration=3
                 )
+            else:
+                af2_models_dir.set(directory)
+                af2_model_files.set([])
+                log_status(f"⚠ No PDB/mmCIF files found in {directory}")
+                ui.notification_show(
+                    "No PDB/mmCIF files found in directory",
+                    type="warning",
+                    duration=3
+                )
+            
+        except Exception as e:
+            log_status(f"Directory scan error: {str(e)}")
+            ui.notification_show(f"Error scanning directory: {str(e)}", type="error", duration=5)
+    
+    @reactive.effect
+    @reactive.event(input.reference_model)
+    def handle_reference_upload():
+        """Handle reference model upload"""
+        file_info = input.reference_model()
+        if not file_info:
+            return
+        
+        try:
+            # Create temporary directory if needed
+            if not os.path.exists(tempfile.gettempdir()):
+                os.makedirs(tempfile.gettempdir())
+            
+            # Save reference model
+            ref_path = os.path.join(tempfile.gettempdir(), f"reference_{file_info[0]['name']}")
+            shutil.copy(file_info[0]['datapath'], ref_path)
+            reference_model_file.set(ref_path)
+            log_status(f"Uploaded reference: {file_info[0]['name']}")
+            
+            ui.notification_show(
+                f"✓ Reference model uploaded: {file_info[0]['name']}",
+                type="success",
+                duration=3
+            )
+            
+        except Exception as e:
+            log_status(f"Reference upload error: {str(e)}")
+            ui.notification_show(f"Error uploading reference: {str(e)}", type="error", duration=5)
+    
+    @reactive.effect
+    @reactive.event(input.reference_sequence)
+    def handle_reference_sequence_upload():
+        """Handle reference sequence (FASTA or PDB) upload"""
+        file_info = input.reference_sequence()
+        if not file_info:
+            return
+        
+        try:
+            # Create temporary directory if needed
+            if not os.path.exists(tempfile.gettempdir()):
+                os.makedirs(tempfile.gettempdir())
+            
+            # Save reference file
+            filename = file_info[0]['name']
+            ref_path = os.path.join(tempfile.gettempdir(), f"reference_sequence_{filename}")
+            shutil.copy(file_info[0]['datapath'], ref_path)
+            reference_sequence_file.set(ref_path)
+            log_status(f"Uploaded reference: {filename}")
+            
+            ui.notification_show(
+                f"✓ Reference sequence uploaded: {file_info[0]['name']}",
+                type="success",
+                duration=3
+            )
+            
+        except Exception as e:
+            log_status(f"Reference sequence upload error: {str(e)}")
+            ui.notification_show(f"Error uploading reference sequence: {str(e)}", type="error", duration=5)
+            ui.notification_show(f"Reference upload failed: {str(e)}", type="error", duration=5)
     
     # Import visualization functions for export
     from visualization.interactive import (
@@ -1255,21 +1113,6 @@ def server(input, output, session):
         
         # Apply theme via CSS only (no page reload)
         await session.send_custom_message('theme-change', {'theme': new_theme})
-    
-    # Cleanup temporary directory on session end
-    @reactive.effect
-    def cleanup():
-        """Clean up temporary files when session ends"""
-        def cleanup_temp():
-            tmp = temp_dir.get()
-            if tmp and os.path.exists(tmp):
-                try:
-                    shutil.rmtree(tmp)
-                    print(f"Cleaned up temp directory: {tmp}")
-                except Exception as e:
-                    print(f"Error cleaning up temp directory: {e}")
-        
-        session.on_ended(cleanup_temp)
     
     # Download all results as ZIP
     @render.download(filename=lambda: f"clustaldm_results_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.zip")
@@ -1306,10 +1149,6 @@ def server(input, output, session):
             if rmsd_stats.get() is not None:
                 csv_buffer = rmsd_stats.get().to_csv(index=False)
                 zipf.writestr("cluster_rmsd_summary.csv", csv_buffer)
-            
-            if sasa_data.get() is not None:
-                csv_buffer = sasa_data.get().to_csv(index=False)
-                zipf.writestr("delta_sasa_results.csv", csv_buffer)
             
             # Add plots as HTML
             try:
@@ -1417,10 +1256,6 @@ def server(input, output, session):
                         info_lines.append(f"\n{row['structure']}:\n")
                         info_lines.append(f"  Protein contacts: {row['n_protein_residues']}\n")
                         info_lines.append(f"  Nucleic contacts: {row['n_nucleic_residues']}\n")
-                        if 'total_delta_sasa' in row and pd.notna(row['total_delta_sasa']):
-                            info_lines.append(f"  Total ΔSASA: {row['total_delta_sasa']:.2f} Å²\n")
-                        if 'motif_delta_sasa' in row and pd.notna(row['motif_delta_sasa']):
-                            info_lines.append(f"  Motif ΔSASA: {row['motif_delta_sasa']:.2f} Å²\n")
                         if row.get('representative', False):
                             info_lines.append(f"  ** CLUSTER REPRESENTATIVE **\n")
             
@@ -1459,89 +1294,26 @@ def server(input, output, session):
         return ui.p("Select a cluster above", style="color: #6c757d; margin-top: 10px;")
     
     @reactive.effect
-    @reactive.event(input.run_clustering, auto_run_trigger)
+    @reactive.event(input.run_clustering)
     def run_analysis():
         global clust, pdb_dir_path
         
         # Import necessary modules at function start
         import os
         import MDAnalysis as mda
-        import freesasa
         
         # Clear previous log
         status_log.set([])
         
-        # Check if we need to generate poses first
-        uploaded = uploaded_files.get()
-        receptor = receptor_pdb_file.get()
-        ligand = ligand_pdb_file.get()
-        pdb_files = parsed_pdbs.get()
+        # Get AF2 models directory and files
+        models_dir = af2_models_dir.get()
+        model_files = af2_model_files.get()
+        ref_model = reference_model_file.get()
         
-        # Validate uploads
-        if not uploaded:
-            ui.notification_show("⚠️ Please upload HDOCK .out file(s) first!", type="error", duration=5)
+        # Validate inputs
+        if not models_dir or not model_files:
+            ui.notification_show("⚠️ Please specify a valid directory with AlphaFold2 models!", type="error", duration=5)
             return
-        if not receptor:
-            ui.notification_show("⚠️ Please upload receptor PDB file!", type="error", duration=5)
-            return
-        if not ligand:
-            ui.notification_show("⚠️ Please upload ligand PDB file!", type="error", duration=5)
-            return
-        
-        # Generate ALL poses if not already done
-        if not pdb_files:
-            log_status("=" * 50)
-            log_status(f"📦 Extracting poses from HDOCK results (max {input.max_poses()} per file)...")
-            log_status("=" * 50)
-            
-            try:
-                tmp = temp_dir.get()
-                all_pdbs = []
-                
-                for out_path in uploaded:
-                    filename = os.path.basename(out_path)
-                    log_status(f"Parsing: {filename}")
-                    
-                    try:
-                        parser = HDOCKParser(out_path)
-                        total_poses = parser.num_poses
-                        log_status(f"  → Found {total_poses} poses in {filename}")
-                        
-                        output_dir = os.path.join(tmp, f"poses_{Path(filename).stem}")
-                        os.makedirs(output_dir, exist_ok=True)
-                        
-                        # Get max_poses parameter from slider
-                        max_poses_limit = input.max_poses()
-                        
-                        # Generate PDB files up to max_poses limit
-                        generated = parser.generate_all_poses(
-                            output_dir=output_dir,
-                            max_poses=max_poses_limit,
-                            receptor_pdb=receptor,
-                            ligand_pdb=ligand
-                        )
-                        
-                        all_pdbs.extend(generated)
-                        log_status(f"  ✓ Extracted {len(generated)} poses")
-                        
-                    except Exception as e:
-                        log_status(f"  ✗ Error parsing {filename}: {str(e)}")
-                        ui.notification_show(
-                            f"Error parsing {filename}: {str(e)}",
-                            type="error",
-                            duration=5
-                        )
-                        return
-                
-                parsed_pdbs.set(all_pdbs)
-                pdb_files = all_pdbs
-                log_status(f"✓ Total poses extracted: {len(all_pdbs)}")
-                log_status("")
-                
-            except Exception as e:
-                log_status(f"Pose generation error: {str(e)}")
-                ui.notification_show(f"Pose generation failed: {str(e)}", type="error", duration=5)
-                return
         
         # Show immediate notification for job submission
         ui.notification_show("🚀 Running clustering analysis...", type="message", duration=3)
@@ -1552,14 +1324,17 @@ def server(input, output, session):
         
         # Show input acknowledgement
         log_status("="*50)
-        log_status("🚀 Starting Clustering Analysis")
+        log_status("🚀 Starting Clustering Analysis (AlphaFold2 Models)")
         log_status("="*50)
-        log_status(f"Total structures: {len(pdb_files)}")
+        log_status(f"Total structures: {len(model_files)}")
         log_status(f"HDBSCAN min_cluster_size: {min_cluster_size}")
         log_status(f"HDBSCAN min_samples: {min_samples_hdb}")
+        if ref_model:
+            log_status(f"Reference model: {os.path.basename(ref_model)}")
         log_status("")
         
-        pdb_dir_path = temp_dir.get()  # Use temp directory
+        pdb_dir_path = models_dir
+        pdb_files = model_files
         
         try:
             log_status(f"✓ Analyzing {len(pdb_files)} structures")
@@ -1569,7 +1344,72 @@ def server(input, output, session):
             log_status("Initializing clusterer...")
             ui.notification_show("📊 Initializing clusterer...", type="message", duration=2)
             from core.analysis import InterfaceAnalyzer
+            from core.io_utils import read_fasta_sequence, extract_sequence_from_pdb
+            
             clust = PDBClusterer(pdb_files)
+            
+            # Load reference sequence if provided (FASTA or PDB)
+            ref_seq_file = reference_sequence_file.get()
+            ref_model_file = reference_model_file.get()
+            
+            print(f"\n=== Reference Loading ===")
+            print(f"  ref_seq_file: {ref_seq_file}")
+            print(f"  ref_model_file: {ref_model_file}")
+            print(f"  ref_seq exists: {os.path.exists(ref_seq_file) if ref_seq_file else False}")
+            print(f"  ref_model exists: {os.path.exists(ref_model_file) if ref_model_file else False}")
+            
+            # Initialize reference attributes
+            clust.reference_sequence = None
+            clust.reference_pdb = None  # Store PDB path if reference is a PDB
+            
+            # Priority 1: Reference sequence file (can be FASTA or PDB)
+            if ref_seq_file and os.path.exists(ref_seq_file):
+                try:
+                    # Check if it's a PDB or FASTA file
+                    if ref_seq_file.lower().endswith('.pdb'):
+                        ref_sequence = extract_sequence_from_pdb(ref_seq_file, chain_id='A')
+                        log_status(f"✓ Reference sequence extracted from PDB: {len(ref_sequence)} residues")
+                        print(f"  Extracted from PDB: {len(ref_sequence)} residues")
+                        print(f"  First 50 chars: {ref_sequence[:50]}")
+                        # Store PDB path for visualization
+                        clust.reference_pdb = ref_seq_file
+                        print(f"  Stored reference_pdb path: {ref_seq_file}")
+                    else:
+                        ref_sequence = read_fasta_sequence(ref_seq_file)
+                        log_status(f"✓ Reference sequence loaded from FASTA: {len(ref_sequence)} residues")
+                        print(f"  Loaded from FASTA: {len(ref_sequence)} residues")
+                        print(f"  First 50 chars: {ref_sequence[:50]}")
+                    
+                    # Explicitly set the reference sequence
+                    clust.reference_sequence = ref_sequence
+                    print(f"  Set clust.reference_sequence to string of length {len(ref_sequence)}")
+                    print(f"  Verification: clust.reference_sequence is None = {clust.reference_sequence is None}")
+                    log_status("  → Will validate and correct residue numbering")
+                except Exception as e:
+                    import traceback
+                    log_status(f"Warning: Could not load reference sequence: {e}")
+                    log_status("  → Proceeding without sequence validation")
+                    print(f"  ERROR: {e}")
+                    traceback.print_exc()
+                    clust.reference_sequence = None
+                    clust.reference_pdb = None
+            
+            # Priority 2: Reference model file (if no sequence file provided but model exists)
+            if clust.reference_pdb is None and ref_model_file and os.path.exists(ref_model_file):
+                print(f"  Using reference model for visualization: {ref_model_file}")
+                clust.reference_pdb = ref_model_file
+                # Also extract sequence from model if not already done
+                if clust.reference_sequence is None:
+                    try:
+                        ref_sequence = extract_sequence_from_pdb(ref_model_file, chain_id='A')
+                        clust.reference_sequence = ref_sequence
+                        print(f"  Extracted sequence from reference model: {len(ref_sequence)} residues")
+                    except Exception as e:
+                        print(f"  Could not extract sequence from reference model: {e}")
+            
+            if clust.reference_sequence is None and clust.reference_pdb is None:
+                print(f"  No reference file provided or file doesn't exist")
+            
             log_status("✓ Clusterer initialized")
             log_status("")
             
@@ -1577,171 +1417,80 @@ def server(input, output, session):
             motif_input = input.motif_residues().strip()
             motif_dict = InterfaceAnalyzer.parse_motif_residues(motif_input) if motif_input else None
             
-            # STEP 1: Compute Jaccard matrix (chain-aware!) with smart filtering
+            # Get ligand chain ID
+            ligand_chain = input.ligand_chain().strip() or "B"
+            log_status(f"Ligand chain: {ligand_chain}")
+            
+            # STEP 1: Compute Jaccard matrix (chain-aware!)
             log_status("STEP 1: Computing Jaccard contact matrix...")
             ui.notification_show("🧬 STEP 1: Computing contact matrix...", type="message", duration=3)
             if motif_dict:
-                log_status(f"  \ud83c\udfaf MOTIF MODE: Local search enabled")
+                log_status(f"  🎯 MOTIF MODE: Local search enabled")
                 log_status(f"  Motif: {motif_input}")
-                log_status(f"  \u2192 Off-target poses (no motif contact) will be filtered")
+                log_status(f"  → Off-target poses (no motif contact) will be filtered")
             else:
-                log_status(f"  \ud83c\udf0d GLOBAL MODE: SASA pre-filtering enabled")
-                log_status(f"  \u2192 Non-interacting poses (\u0394SASA < 0.01 \u00c5\u00b2) will be filtered")
-            clust.compute_jaccard_contact_matrix(n_jobs=-1, motif_residues=motif_dict)  # Use all CPU cores
+                log_status(f"  🌍 GLOBAL MODE: All interface contacts")
+            
+            # Use chain-specific selections for AlphaFold2 models
+            # MDTraj uses chainid == X syntax (0-indexed or letter-based)
+            # Target protein is all protein atoms NOT in ligand chain, ligand is the specified chain
+            protein_selection = f"protein and not (chainid == {ord(ligand_chain) - ord('A')})"
+            ligand_selection = f"chainid == {ord(ligand_chain) - ord('A')}"
+            
+            log_status(f"  Target (protein) selection: {protein_selection}")
+            log_status(f"  Ligand selection: {ligand_selection}")
+            
+            # Get residue offset toggle
+            apply_offset = input.apply_residue_offset()
+            if apply_offset:
+                log_status(f"  📊 Residue offset correction: ENABLED (for chopped models)")
+            else:
+                log_status(f"  📊 Residue offset correction: DISABLED (full-length models)")
+            
+            clust.compute_jaccard_contact_matrix(
+                n_jobs=-1, 
+                motif_residues=motif_dict,
+                protein_selection=protein_selection,
+                nucleic_selection=ligand_selection,
+                apply_offset=apply_offset
+            )  # Use all CPU cores
             log_status("✓ Jaccard matrix computed")
             ui.notification_show("✓ Contact matrix done", type="message", duration=2)
             log_status("")
             
-            # STEP 2: Compute RMSD matrix for QC (nucleic P atoms, no alignment)
-            log_status("STEP 2: Computing RMSD matrix (for QC)...")
+            # STEP 2: Compute RMSD matrix
+            log_status("STEP 2: Computing RMSD matrix...")
             ui.notification_show("📏 STEP 2: Computing RMSD...", type="message", duration=3)
             # Load structures for RMSD calculation
             clust.load_structures()
-            # Temporarily change selection for RMSD calculation
+            
+            # Determine reference index for RMSD calculation
+            ref_idx = 0  # Default to first structure
+            if ref_model and os.path.exists(ref_model):
+                try:
+                    # Add reference model to the beginning of universes for superposition
+                    ref_universe = mda.Universe(ref_model)
+                    log_status(f"  Using reference model for superposition: {os.path.basename(ref_model)}")
+                    # We'll use it for alignment but not include in clustering
+                except Exception as e:
+                    log_status(f"  ⚠️ Could not load reference model, using first structure: {e}")
+                    ref_universe = None
+            
+            # Compute RMSD with reference-based superposition if available
+            # For AlphaFold, use 'protein and name CA' selection (standard)
             original_selection = clust.selection
-            clust.selection = 'nucleic and name P'
-            clust.compute_distance_matrix(align_structures=False, n_jobs=-1)  # Parallel RMSD!
+            clust.selection = 'protein and name CA'
+            
+            clust.compute_distance_matrix(align_structures=True, reference_idx=ref_idx, n_jobs=-1)
             rmsd_mat = clust.distance_matrix.copy()  # Save RMSD matrix
             rmsd_matrix.set(rmsd_mat)
             clust.selection = original_selection  # Restore original
             log_status("✓ RMSD matrix computed")
-            print("\n=== CHECKPOINT: RMSD computation complete ===", flush=True)
             ui.notification_show("✓ RMSD done", type="message", duration=2)
             log_status("")
             
-            # STEP 2.5: Compute ΔSASA for each structure
-            print("\n=== CHECKPOINT: Starting SASA computation ===", flush=True)
-            log_status("STEP 2.5: Computing ΔSASA (buried surface area)...")
-            ui.notification_show("💧 STEP 2.5: Computing ΔSASA...", type="message", duration=3)
-            
-            # Store motif for later use in visualization (already parsed above)
+            # Store motif for later use in visualization
             current_motif.set(motif_dict)
-            
-            # Only use motif and split mode if motif is actually provided
-            use_motif = motif_dict is not None and len(motif_dict) > 0
-            
-            if use_motif:
-                log_status(f"  Using motif: {motif_input}")
-            
-            # PERFORMANCE OPTIMIZATION: Compute protein and nucleic SASA only once
-            # (they're identical across all poses, only complex changes)
-            log_status("  Pre-computing isolated protein and nucleic acid SASA (once)...")
-            # Extract reference protein/nucleic structures for SASA optimization
-            # (workers will compute SASA from these files, not pickle C structures)
-            protein_pdb_path = None
-            nucleic_pdb_path = None
-            
-            if len(clust.pdb_files) > 0:
-                try:
-                    # Use first structure to extract protein/nucleic for reference
-                    first_pdb = clust.pdb_files[0]
-                    u = mda.Universe(first_pdb)
-                    
-                    # Create temp directory for separated structures
-                    basename = os.path.basename(first_pdb).replace('.pdb', '')
-                    debug_dir = os.path.join(os.path.dirname(first_pdb), 'sasa_debug')
-                    os.makedirs(debug_dir, exist_ok=True)
-                    
-                    protein_pdb_path = os.path.join(debug_dir, f"{basename}_protein_reference.pdb")
-                    nucleic_pdb_path = os.path.join(debug_dir, f"{basename}_nucleic_reference.pdb")
-                    
-                    # Extract protein and nucleic structures
-                    protein_atoms = u.select_atoms("protein")
-                    nucleic_atoms = u.select_atoms("nucleic")
-                    protein_atoms.write(protein_pdb_path)
-                    nucleic_atoms.write(nucleic_pdb_path)
-                    
-                    log_status(f"  ✓ Reference structures extracted (workers will compute SASA in parallel)")
-                    
-                except Exception as e:
-                    log_status(f"  ⚠️ Could not extract reference structures, will compute per-structure: {e}")
-                    protein_pdb_path = None
-                    nucleic_pdb_path = None
-            
-            log_status("")
-            log_status("STEP 2: Computing ΔSASA for all structures...")
-            log_status(f"Mode: {'Motif + Split by chain' if input.sasa_mode() == 'split' and use_motif else 'Motif only' if use_motif else 'Total interface'}")
-            log_status(f"Processing {len(clust.pdb_files)} structures in parallel...")
-            ui.notification_show(f"⚙️ Processing {len(clust.pdb_files)} structures...", type="message", duration=3)
-            
-            # Read SASA mode parameter BEFORE parallel execution (can't pickle reactive context)
-            split_mode = input.sasa_mode() == "split" and use_motif
-            
-            # Prepare arguments for parallel processing (only picklable objects)
-            sasa_args = []
-            for idx, pdb_file in enumerate(clust.pdb_files):
-                sasa_args.append((
-                    idx, pdb_file, clust.contact_residue_pairs, split_mode,
-                    motif_dict if use_motif else None,
-                    protein_pdb_path, nucleic_pdb_path
-                ))
-            
-            # Run parallel computation with multiprocessing (worker function defined at module level)
-            from multiprocessing import Pool, cpu_count
-            log_status(f"  Using {cpu_count()} CPU cores for parallel SASA computation...")
-            print(f"\n=== CHECKPOINT: About to create Pool with {cpu_count()} cores ===", flush=True)
-            print(f"=== Processing {len(sasa_args)} structures ===", flush=True)
-            
-            # Use imap_unordered to get results as they complete (allows progress updates)
-            sasa_results = []
-            print("=== CHECKPOINT: Creating Pool ===", flush=True)
-            pool = Pool(processes=cpu_count())
-            try:
-                print("=== CHECKPOINT: Pool created, starting imap_unordered ===", flush=True)
-                total = len(sasa_args)
-                # Use larger chunksize for better efficiency with large datasets
-                # This reduces IPC overhead by batching work to processes
-                chunksize = max(1, total // (cpu_count() * 4))
-                print(f"=== Using chunksize={chunksize} for {total} structures ===", flush=True)
-                for i, result in enumerate(pool.imap_unordered(_compute_sasa_worker, sasa_args, chunksize=chunksize), 1):
-                    sasa_results.append(result)
-                    # Show progress every 10% or every 20 structures (whichever is smaller)
-                    progress_interval = min(20, max(1, total // 10))
-                    if i % progress_interval == 0 or i == total:
-                        percent = int(100 * i / total)
-                        log_status(f"  Progress: {i}/{total} structures ({percent}%)")
-                        print(f"SASA Progress: {percent}% ({i}/{total})", flush=True)
-                
-                print(f"\n=== CHECKPOINT: Loop complete, closing pool ===", flush=True)
-            finally:
-                pool.close()
-                print("=== CHECKPOINT: Pool closed, joining ===", flush=True)
-                pool.join()
-                print("=== CHECKPOINT: Pool joined ===", flush=True)
-            
-            print(f"=== CHECKPOINT: Got {len(sasa_results)} results, creating DataFrame ===", flush=True)
-            log_status(f"✓ SASA computation complete for {total} structures")
-            ui.notification_show("✓ SASA computation complete", type="message", duration=2)
-            
-            # Store ΔSASA results
-            print("=== CHECKPOINT: Calling pd.DataFrame() ===", flush=True)
-            sasa_df = pd.DataFrame(sasa_results)
-            print(f"=== CHECKPOINT: DataFrame created with {len(sasa_df)} rows ===", flush=True)
-            
-            # DEBUG: Check what we actually got
-            log_status(f"DEBUG: Created SASA DataFrame with {len(sasa_df)} rows")
-            log_status(f"DEBUG: SASA DataFrame columns: {sasa_df.columns.tolist()}")
-            if len(sasa_df) > 0:
-                log_status(f"DEBUG: First row total_delta_sasa: {sasa_df['total_delta_sasa'].iloc[0]}")
-                log_status(f"DEBUG: First row structure: {sasa_df['structure'].iloc[0]}")
-            
-            sasa_data.set(sasa_df)  # Save to reactive value
-            
-            # Count errors
-            n_errors = sum(1 for r in sasa_results if 'error' in r)
-            if n_errors > 0:
-                log_status(f"⚠️  ΔSASA computation completed with {n_errors} errors")
-            else:
-                log_status(f"✓ ΔSASA computed successfully for all {len(sasa_results)} structures")
-            
-            # Log motif ΔSASA range only if motif was used
-            if use_motif and 'motif_delta_sasa' in sasa_df.columns:
-                motif_values = sasa_df['motif_delta_sasa'].dropna()
-                if len(motif_values) > 0:
-                    log_status(f"  Motif ΔSASA range: {motif_values.min():.1f} - {motif_values.max():.1f} Å²")
-            
-            log_status(f"  Total ΔSASA range: {sasa_df['total_delta_sasa'].min():.1f} - {sasa_df['total_delta_sasa'].max():.1f} Å²")
-            log_status("")
             
             # STEP 3: Cluster by Jaccard only
             log_status("STEP 3: Clustering by Jaccard distance...")
@@ -1751,12 +1500,10 @@ def server(input, output, session):
             clust.metric_name = "Jaccard"
             
             filter_dupes = input.filter_duplicates()
-            dup_threshold = input.duplicate_threshold()
             clust.cluster_hdbscan(
                 min_cluster_size=min_cluster_size, 
                 min_samples=min_samples_hdb,
-                filter_duplicates=filter_dupes,
-                duplicate_threshold=dup_threshold
+                filter_duplicates=filter_dupes
             )
             
             n_clusters = len(set(clust.labels)) - (1 if -1 in clust.labels else 0)
@@ -1796,31 +1543,6 @@ def server(input, output, session):
                 stats_df['representative'] = stats_df.apply(is_representative, axis=1)
                 stats_df = stats_df.drop(columns=['structure_idx'])
             
-            # Merge ΔSASA data if available
-            sasa_df_current = sasa_data.get()
-            if sasa_df_current is not None:
-                log_status(f"DEBUG: SASA data has {len(sasa_df_current)} rows")
-                log_status(f"DEBUG: Stats data has {len(stats_df)} rows")
-                log_status(f"DEBUG: SASA columns: {sasa_df_current.columns.tolist()}")
-                log_status(f"DEBUG: Stats columns before merge: {stats_df.columns.tolist()}")
-                
-                # Check structure names match
-                log_status(f"DEBUG: Sample SASA structures: {sasa_df_current['structure'].head(3).tolist()}")
-                log_status(f"DEBUG: Sample Stats structures: {stats_df['structure'].head(3).tolist()}")
-                
-                # Merge all SASA columns except 'structure' (which is the key)
-                # Keep 'error' column if present to show which SASA computations failed
-                sasa_cols_to_merge = [col for col in sasa_df_current.columns if col != 'structure']
-                stats_df = stats_df.merge(
-                    sasa_df_current[['structure'] + sasa_cols_to_merge], 
-                    on='structure', 
-                    how='left'
-                )
-                log_status(f"DEBUG: Stats columns after merge: {stats_df.columns.tolist()}")
-                log_status(f"DEBUG: Sample total ΔSASA values: {stats_df['total_delta_sasa'].head(3).tolist()}")
-                if 'motif_delta_sasa' in stats_df.columns:
-                    log_status(f"DEBUG: Sample motif ΔSASA values: {stats_df['motif_delta_sasa'].head(3).tolist()}")
-            
             # Add motif match scores if available
             if hasattr(clust, 'motif_match_scores') and clust.motif_match_scores is not None:
                 match_scores = clust.motif_match_scores
@@ -1836,50 +1558,13 @@ def server(input, output, session):
             log_status("✓ Hotspot analysis complete")
             log_status("")
             
-            # Get cluster summary withwe RMSD QC
+            # Get cluster summary with RMSD QC
             summary_df = clust.get_cluster_summary(threshold=50)
             
             # Add RMSD stats to summary
             summary_with_rmsd = summary_df.merge(
                 rmsd_qc, on='cluster', how='left'
             )
-            
-            # Add ΔSASA stats to summary (mean and std per cluster)
-            sasa_df_current = sasa_data.get()
-            if sasa_df_current is not None and 'total_delta_sasa' in sasa_df_current.columns:
-                # Merge cluster labels with SASA data
-                sasa_with_labels = sasa_df_current.copy()
-                sasa_with_labels['cluster'] = clust.labels
-                
-                # Calculate cluster-level ΔSASA statistics
-                agg_dict = {'total_delta_sasa': ['mean', 'std', 'max']}
-                if 'motif_delta_sasa' in sasa_with_labels.columns:
-                    agg_dict['motif_delta_sasa'] = ['mean', 'std']
-                
-                # Add per-chain ΔSASA columns if available
-                chain_cols = [col for col in sasa_with_labels.columns if col.startswith('chain_') and col.endswith('_sasa')]
-                for col in chain_cols:
-                    agg_dict[col] = ['mean', 'std']
-                
-                sasa_cluster_stats = sasa_with_labels.groupby('cluster').agg(agg_dict).reset_index()
-                
-                # Flatten column names
-                new_cols = ['cluster', 'mean_delta_sasa', 'std_delta_sasa', 'max_delta_sasa']
-                if 'motif_delta_sasa' in agg_dict:
-                    new_cols.extend(['mean_motif_sasa', 'std_motif_sasa'])
-                
-                # Add chain-specific column names
-                for col in chain_cols:
-                    chain_id = col.replace('chain_', '').replace('_sasa', '')
-                    new_cols.extend([f'mean_chain_{chain_id}_sasa', f'std_chain_{chain_id}_sasa'])
-                
-                sasa_cluster_stats.columns = new_cols
-                
-                # Merge with summary
-                summary_with_rmsd = summary_with_rmsd.merge(
-                    sasa_cluster_stats, on='cluster', how='left'
-                )
-                log_status("✓ ΔSASA stats added to cluster summary")
             
             # Add motif match scores if available
             if hasattr(clust, 'motif_match_scores') and clust.motif_match_scores is not None:
@@ -1999,6 +1684,7 @@ def server(input, output, session):
             ui.update_select("contact_heatmap_cluster", choices=cluster_ids, selected=default_intra)
             ui.update_select("jaccard_intra_cluster", choices=intra_cluster_choices, selected=default_intra)
             ui.update_select("rmsd_intra_cluster", choices=intra_cluster_choices, selected=default_intra)
+            ui.update_select("sequence_viz_cluster", choices=cluster_ids, selected=default_intra)
             
             # Update export cluster dropdown (only specific clusters, no "all" option)
             export_choices = {}
@@ -2057,13 +1743,12 @@ def server(input, output, session):
         min_cluster_size = input.min_cluster_size()
         min_samples_hdb = input.min_samples_hdb()
         filter_dupes = input.filter_duplicates()
-        dup_threshold = input.duplicate_threshold()
         
         log_status("")
         log_status("="*50)
         log_status("🔄 Re-Clustering with new parameters...")
         log_status(f"New min_cluster_size: {min_cluster_size}, New min_samples: {min_samples_hdb}")
-        log_status(f"Filter duplicates: {filter_dupes}, Threshold: {dup_threshold}")
+        log_status(f"Filter duplicates: {filter_dupes}")
         log_status("="*50)
         
         try:
@@ -2073,8 +1758,7 @@ def server(input, output, session):
             clust.cluster_hdbscan(
                 min_cluster_size=min_cluster_size, 
                 min_samples=min_samples_hdb,
-                filter_duplicates=filter_dupes,
-                duplicate_threshold=dup_threshold
+                filter_duplicates=filter_dupes
             )
             
             n_clusters = len(set(clust.labels)) - (1 if -1 in clust.labels else 0)
@@ -2104,16 +1788,6 @@ def server(input, output, session):
                 stats_df['representative'] = stats_df.apply(is_representative, axis=1)
                 stats_df = stats_df.drop(columns=['structure_idx'])
             
-            # Merge SASA data
-            sasa_df_current = sasa_data.get()
-            if sasa_df_current is not None:
-                sasa_cols_to_merge = [col for col in sasa_df_current.columns if col != 'structure']
-                stats_df = stats_df.merge(
-                    sasa_df_current[['structure'] + sasa_cols_to_merge],
-                    on='structure',
-                    how='left'
-                )
-            
             # Store updated stats
             interface_stats.set(stats_df)
             
@@ -2129,26 +1803,6 @@ def server(input, output, session):
             # Add RMSD stats
             summary_with_rmsd = summary.merge(rmsd_qc[['cluster', 'mean_rmsd', 'std_rmsd', 'medoid_idx']], 
                                                on='cluster', how='left')
-            
-            # Add SASA stats
-            if sasa_df_current is not None:
-                sasa_with_labels = sasa_df_current.copy()
-                sasa_with_labels['cluster'] = clust.labels
-                agg_dict = {'total_delta_sasa': ['mean', 'std', 'max']}
-                if 'motif_delta_sasa' in sasa_with_labels.columns:
-                    agg_dict['motif_delta_sasa'] = ['mean', 'std']
-                chain_cols = [col for col in sasa_with_labels.columns if col.startswith('chain_') and col.endswith('_sasa')]
-                for col in chain_cols:
-                    agg_dict[col] = ['mean', 'std']
-                sasa_cluster_stats = sasa_with_labels.groupby('cluster').agg(agg_dict).reset_index()
-                new_cols = ['cluster', 'mean_delta_sasa', 'std_delta_sasa', 'max_delta_sasa']
-                if 'motif_delta_sasa' in agg_dict:
-                    new_cols.extend(['mean_motif_sasa', 'std_motif_sasa'])
-                for col in chain_cols:
-                    chain_id = col.replace('chain_', '').replace('_sasa', '')
-                    new_cols.extend([f'mean_chain_{chain_id}_sasa', f'std_chain_{chain_id}_sasa'])
-                sasa_cluster_stats.columns = new_cols
-                summary_with_rmsd = summary_with_rmsd.merge(sasa_cluster_stats, on='cluster', how='left')
             
             cluster_summary.set(summary_with_rmsd)
             
@@ -2173,6 +1827,7 @@ def server(input, output, session):
             ui.update_select("viewer_cluster", choices=cluster_choices, selected=default_cluster)
             ui.update_select("cluster_select_hotspot", choices=cluster_ids)
             ui.update_select("contact_heatmap_cluster", choices=cluster_ids, selected=cluster_ids[0] if cluster_ids else "")
+            ui.update_select("sequence_viz_cluster", choices=cluster_ids, selected=cluster_ids[0] if cluster_ids else "")
             
             # Update export cluster dropdown
             export_choices = {}
@@ -2413,60 +2068,41 @@ def server(input, output, session):
     @output
     @render.ui
     def interface_quality_cards():
-        """Quality metric cards for interface metrics (ΔSASA)"""
+        """Quality metric cards for interface metrics"""
         if not analysis_complete.get() or clust is None:
             return ui.p("Run analysis to see metrics", style="padding: 20px; text-align: center;")
         
-        # Get ΔSASA statistics
-        sasa_df = sasa_data.get()
-        if sasa_df is not None and 'total_delta_sasa' in sasa_df.columns:
-            mean_sasa = sasa_df['total_delta_sasa'].mean()
-            max_sasa = sasa_df['total_delta_sasa'].max()
-            # Get motif SASA on protein (should be constant, take first non-null value)
-            if 'motif_sasa_protein' in sasa_df.columns:
-                motif_sasa_protein = sasa_df['motif_sasa_protein'].dropna().iloc[0] if len(sasa_df['motif_sasa_protein'].dropna()) > 0 else None
-            else:
-                motif_sasa_protein = None
+        # For AlphaFold2 models, we could show pLDDT-related metrics here in the future
+        # For now, show contact-based metrics
+        stats_df = interface_stats.get()
+        if stats_df is not None:
+            mean_protein_contacts = stats_df['n_protein_residues'].mean()
+            mean_nucleic_contacts = stats_df['n_nucleic_residues'].mean()
+            max_protein_contacts = stats_df['n_protein_residues'].max()
         else:
-            # No SASA data
-            return ui.p("ΔSASA not calculated", style="padding: 20px; text-align: center; color: #999;")
+            return ui.p("Interface statistics not available", style="padding: 20px; text-align: center; color: #999;")
         
         # 3 interface quality cards
         cards = [
             ui.div(
-                ui.h2(f"{mean_sasa:.0f} Å²", class_="text-warning", style="font-size: 3em; margin: 10px 0;"),
-                ui.p("Mean Buried ΔSASA", style="margin: 5px 0; font-size: 0.9em;"),
+                ui.h2(f"{mean_protein_contacts:.0f}", class_="text-warning", style="font-size: 3em; margin: 10px 0;"),
+                ui.p("Mean Protein Contacts", style="margin: 5px 0; font-size: 0.9em;"),
                 class_="text-center mb-3",
                 style="padding: 10px;"
             ),
             ui.div(
-                ui.h2(f"{max_sasa:.0f} Å²", class_="text-warning", style="font-size: 3em; margin: 10px 0;"),
-                ui.p("Max Buried ΔSASA", style="margin: 5px 0; font-size: 0.9em;"),
+                ui.h2(f"{max_protein_contacts:.0f}", class_="text-warning", style="font-size: 3em; margin: 10px 0;"),
+                ui.p("Max Protein Contacts", style="margin: 5px 0; font-size: 0.9em;"),
                 class_="text-center mb-3",
+                style="padding: 10px;"
+            ),
+            ui.div(
+                ui.h2(f"{mean_nucleic_contacts:.0f}", class_="text-info", style="font-size: 3em; margin: 10px 0;"),
+                ui.p("Mean Nucleic Contacts", style="margin: 5px 0;"),
+                class_="text-center",
                 style="padding: 10px;"
             )
         ]
-        
-        # Add motif SASA if available
-        if motif_sasa_protein is not None:
-            cards.append(
-                ui.div(
-                    ui.h2(f"{motif_sasa_protein:.0f} Å²", class_="text-warning", style="font-size: 3em; margin: 10px 0;"),
-                    ui.p("Motif SASA", style="margin: 5px 0;"),
-                    class_="text-center",
-                    style="padding: 10px;"
-                )
-            )
-        else:
-            # Placeholder for alignment
-            cards.append(
-                ui.div(
-                    ui.h2("—", class_="text-muted", style="font-size: 3em; margin: 10px 0;"),
-                    ui.p("Motif SASA", style="margin: 5px 0; color: #999;"),
-                    class_="text-center",
-                    style="padding: 10px;"
-                )
-            )
         
         return ui.TagList(*cards)
     
@@ -2488,22 +2124,8 @@ def server(input, output, session):
                        'mean_rmsd', 'std_rmsd', 'median_rmsd', 'max_rmsd', 'min_rmsd',
                        'mean_rmsd_sequential', 'medoid_avg_rmsd', 'medoid_structure']
         
-        # Add ΔSASA columns if available
-        if 'mean_delta_sasa' in summary_df.columns:
-            display_cols.extend(['mean_delta_sasa', 'std_delta_sasa', 'max_delta_sasa'])
-        if 'mean_motif_sasa' in summary_df.columns:
-            display_cols.extend(['mean_motif_sasa', 'std_motif_sasa'])
-        
-        # Add per-chain ΔSASA columns if available
-        chain_sasa_cols = [col for col in summary_df.columns if col.startswith('mean_chain_') and col.endswith('_sasa')]
-        for col in chain_sasa_cols:
-            display_cols.append(col)
-            # Also add std columns
-            std_col = col.replace('mean_', 'std_')
-            if std_col in summary_df.columns:
-                display_cols.append(std_col)
-        
-        available_cols = [c for c in display_cols if c in summary_df.columns]
+        # Only show columns that actually exist
+        available_cols = [col for col in display_cols if col in summary_df.columns]
         display_df = summary_df[available_cols].copy()
 
         # Apply cluster search/filter if provided
@@ -2539,25 +2161,6 @@ def server(input, output, session):
             rename_map['mean_rmsd_sequential'] = 'Sequential RMSD (Å)'
         if 'medoid_avg_rmsd' in display_df.columns:
             rename_map['medoid_avg_rmsd'] = 'Medoid Avg RMSD (Å)'
-        if 'mean_delta_sasa' in display_df.columns:
-            rename_map['mean_delta_sasa'] = 'Mean Buried ΔSASA (Å²)'
-        if 'std_delta_sasa' in display_df.columns:
-            rename_map['std_delta_sasa'] = 'Std Buried ΔSASA (Å²)'
-        if 'max_delta_sasa' in display_df.columns:
-            rename_map['max_delta_sasa'] = 'Max Buried ΔSASA (Å²)'
-        if 'mean_motif_sasa' in display_df.columns:
-            rename_map['mean_motif_sasa'] = 'Mean Motif ΔSASA (Å²)'
-        if 'std_motif_sasa' in display_df.columns:
-            rename_map['std_motif_sasa'] = 'Std Motif ΔSASA (Å²)'
-        
-        # Rename per-chain ΔSASA columns
-        for col in display_df.columns:
-            if col.startswith('mean_chain_') and col.endswith('_sasa'):
-                chain_id = col.replace('mean_chain_', '').replace('_sasa', '')
-                rename_map[col] = f'Mean Chain {chain_id} ΔSASA (Å²)'
-            elif col.startswith('std_chain_') and col.endswith('_sasa'):
-                chain_id = col.replace('std_chain_', '').replace('_sasa', '')
-                rename_map[col] = f'Std Chain {chain_id} ΔSASA (Å²)'
         
         if rename_map:
             display_df = display_df.rename(columns=rename_map)
@@ -2566,14 +2169,7 @@ def server(input, output, session):
         numeric_cols = ['Avg Motif Match (%)', 'Stability Score',
                        'Intra-Cluster Mean RMSD (Å)', 'Intra-Cluster Std RMSD (Å)', 
                        'Median RMSD (Å)', 'Max RMSD (Å)', 'Min RMSD (Å)',
-                       'Sequential RMSD (Å)', 'Medoid Avg RMSD (Å)',
-                       'Mean Buried ΔSASA (Å²)', 'Std Buried ΔSASA (Å²)', 'Max Buried ΔSASA (Å²)',
-                       'Mean Motif ΔSASA (Å²)', 'Std Motif ΔSASA (Å²)']
-        
-        # Add chain ΔSASA columns to numeric formatting
-        for col in display_df.columns:
-            if 'Chain' in col and 'ΔSASA' in col:
-                numeric_cols.append(col)
+                       'Sequential RMSD (Å)', 'Medoid Avg RMSD (Å)']
         
         for col in numeric_cols:
             if col in display_df.columns:
@@ -2706,8 +2302,7 @@ def server(input, output, session):
             fig = create_cluster_diversity_plot(
                 clust.labels, 
                 rmsd_mat, 
-                clust.pdb_files,
-                sasa_data=sasa_data.get()
+                clust.pdb_files
             )
             html = fig.to_html(full_html=False, include_plotlyjs='require', div_id='cluster_diversity')
             # Dynamic height based on number of clusters
@@ -3032,6 +2627,91 @@ def server(input, output, session):
             return ui.HTML(f"<pre style='color: red;'>Error: {e}\n{traceback.format_exc()}</pre>")
     
     @output
+    @render.ui
+    def sequence_alignment_plot():
+        """Sequence alignment QC visualization with secondary structure and pLDDT"""
+        if clust is None or not analysis_complete.get():
+            return ui.p("Run analysis to view sequence QC", style="padding: 20px; text-align: center;")
+        
+        try:
+            mode = input.sequence_viz_mode()
+            
+            if mode == "medoids":
+                # Medoid comparison mode - get reference sequence if available
+                print(f"\n=== Checking for reference sequence ===")
+                print(f"  clust object exists: {clust is not None}")
+                print(f"  hasattr(clust, 'reference_sequence'): {hasattr(clust, 'reference_sequence') if clust else 'N/A'}")
+                print(f"  hasattr(clust, 'reference_pdb'): {hasattr(clust, 'reference_pdb') if clust else 'N/A'}")
+                
+                ref_seq = None
+                ref_pdb = None
+                
+                if clust and hasattr(clust, 'reference_sequence'):
+                    print(f"  clust.reference_sequence type: {type(clust.reference_sequence)}")
+                    print(f"  clust.reference_sequence is None: {clust.reference_sequence is None}")
+                    if clust.reference_sequence:
+                        print(f"  clust.reference_sequence length: {len(clust.reference_sequence)}")
+                        print(f"  First 50 chars: {clust.reference_sequence[:50]}")
+                        ref_seq = clust.reference_sequence
+                    else:
+                        print(f"  clust.reference_sequence is None or empty")
+                else:
+                    print(f"  No reference_sequence attribute on clusterer")
+                
+                if clust and hasattr(clust, 'reference_pdb'):
+                    print(f"  clust.reference_pdb: {clust.reference_pdb}")
+                    ref_pdb = clust.reference_pdb
+                
+                print(f"  ref_seq to pass: {ref_seq is not None} (length={len(ref_seq) if ref_seq else 0})")
+                print(f"  ref_pdb to pass: {ref_pdb}")
+                
+                # Check cluster_summary
+                print(f"\n=== Checking cluster_summary ===")
+                summary_df = cluster_summary.get()
+                print(f"  cluster_summary is None: {summary_df is None}")
+                if summary_df is not None:
+                    print(f"  cluster_summary shape: {summary_df.shape}")
+                    print(f"  cluster_summary columns: {list(summary_df.columns)}")
+                    if 'consensus_residues' in summary_df.columns:
+                        print(f"  Sample consensus_residues values:")
+                        for idx, row in summary_df.head(3).iterrows():
+                            print(f"    Cluster {row['cluster']}: '{row['consensus_residues']}'")
+                    else:
+                        print(f"  ⚠️ WARNING: 'consensus_residues' column NOT FOUND!")
+                print(f"===================================\n")
+                
+                fig = create_alignment_visualization_medoids(
+                    clust.pdb_files,
+                    clust.labels,
+                    reference_pdb=ref_pdb,
+                    reference_sequence=ref_seq,
+                    cluster_summary=summary_df
+                )
+            else:
+                # Within cluster mode
+                cluster_id_str = input.sequence_viz_cluster()
+                if not cluster_id_str:
+                    return ui.p("Select a cluster", style="padding: 20px; text-align: center;")
+                
+                cluster_id = int(cluster_id_str)
+                
+                fig = create_alignment_visualization_within_cluster(
+                    clust.pdb_files,
+                    clust.labels,
+                    cluster_id
+                )
+            
+            # Convert to HTML
+            html = fig.to_html(full_html=False, include_plotlyjs='require', div_id='sequence_alignment')
+            wrapped_html = f'<div style="width: 100%; height: 800px;">{html}</div>'
+            return ui.HTML(wrapped_html)
+            
+        except Exception as e:
+            import traceback
+            error_msg = f"Error creating sequence alignment visualization: {e}\n{traceback.format_exc()}"
+            return ui.HTML(f"<pre style='color: red;'>{error_msg}</pre>")
+    
+    @output
     @render.data_frame
     def consensus_residues_table():
         """Table showing consensus residues for each cluster"""
@@ -3156,7 +2836,7 @@ def server(input, output, session):
             motif_input = input.motif_residues().strip()
             if motif_input:
                 try:
-                    motif_dict = parse_motif_residues(motif_input)
+                    motif_dict = InterfaceAnalyzer.parse_motif_residues(motif_input)
                 except:
                     pass
         
@@ -3285,60 +2965,11 @@ def server(input, output, session):
             if not pdb_file or not os.path.exists(pdb_file):
                 return ui.p(f"Structure not found: {structure_name}")
             
-            # Always create a SASA-colored PDB for Molstar (it can use B-factor data)
+            # Use the original PDB file directly - no SASA preprocessing needed
+            # AlphaFold2 models already contain pLDDT in B-factor column
             pdb_to_display = pdb_file
-            sasa_min = 0
-            sasa_max = 100
             
-            # Create a PDB with ΔSASA values in B-factor column
-            try:
-                log_status(f"Creating ΔSASA visualization for {structure_name}...")
-                
-                # Get contact data for this structure to identify chains correctly
-                structure_idx = None
-                for i, f in enumerate(clust_ref.pdb_files):
-                    if os.path.basename(f) == structure_name:
-                        structure_idx = i
-                        break
-                
-                contacts = None
-                if structure_idx is not None and clust_ref.contact_residue_pairs:
-                    contacts = clust_ref.contact_residue_pairs[structure_idx]
-                
-                motif = current_motif.get()
-                
-                sasa_pdb = InterfaceAnalyzer.create_sasa_viewer_pdb(
-                    pdb_file, 
-                    motif_residues=motif,
-                    contacts=contacts
-                )
-                
-                if sasa_pdb and os.path.exists(sasa_pdb):
-                    pdb_to_display = sasa_pdb
-                    log_status(f"✓ ΔSASA PDB created: {os.path.basename(sasa_pdb)}")
-                    
-                    # Read metadata for color range
-                    meta_file = sasa_pdb.replace('.pdb', '_meta.txt')
-                    if os.path.exists(meta_file):
-                        with open(meta_file, 'r') as f:
-                            for line in f:
-                                if line.startswith('min='):
-                                    sasa_min = float(line.split('=')[1])
-                                elif line.startswith('max='):
-                                    sasa_max = float(line.split('=')[1])
-                        log_status(f"✓ Color range: {sasa_min:.2f} - {sasa_max:.2f} Å²")
-                else:
-                    log_status("⚠️ Could not create ΔSASA visualization - using original PDB")
-            
-            except Exception as e:
-                import traceback
-                error_msg = f"Error creating ΔSASA visualization: {str(e)}"
-                log_status(f"❌ {error_msg}")
-                # Fall back to original PDB
-                pdb_to_display = pdb_file
-            
-            # Create 3D viewer with Molstar (display settings now handled by Molstar UI)
-            # SASA coloring is enabled by default if SASA data is present
+            # Create 3D viewer with Molstar (display settings handled by Molstar UI)
             viewer_html = create_mol_viewer_html(
                 pdb_to_display, 
                 width=900, 
@@ -3349,9 +2980,6 @@ def server(input, output, session):
                 show_surface=False,        # Default - can be toggled in Molstar
                 surface_opacity=0.7,       # Default
                 zoom_level=1.0,            # Default
-                color_by_sasa=True,        # Always show SASA if available (B-factor data)
-                sasa_min=sasa_min,
-                sasa_max=sasa_max
             )
             
             return ui.HTML(viewer_html)

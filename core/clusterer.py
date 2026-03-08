@@ -47,6 +47,9 @@ class PDBClusterer:
         self.contact_sets = None
         self.contact_residue_pairs = None
         
+        # Residue offset correction
+        self.reference_sequence = None  # Full-length reference sequence
+        
         print(f"Found {self.n_structures} PDB files")
     
     def load_structures(self):
@@ -103,7 +106,8 @@ class PDBClusterer:
     def compute_jaccard_contact_matrix(self, distance_cutoff=4.5,
                                        protein_selection='protein',
                                        nucleic_selection='nucleic',
-                                       n_jobs=1, motif_residues=None):
+                                       n_jobs=1, motif_residues=None,
+                                       apply_offset=False):
         """
         Compute Jaccard distance matrix based on protein-DNA contacts
         
@@ -121,6 +125,9 @@ class PDBClusterer:
             Dict mapping chain_id -> list of residue numbers for motif screening
             Example: {'A': [10, 11, 12], 'B': [30, 31, 32]}
             Poses with no motif contacts are filtered out (marked as off-target)
+        apply_offset : bool
+            If True, apply residue number corrections for chopped AlphaFold models
+            If False, use raw residue numbers from PDB (for full-length models)
         """
         self.distance_matrix, self.contact_sets, self.contact_residue_pairs, \
             pdb_files_filtered, filtered_indices = \
@@ -130,7 +137,8 @@ class PDBClusterer:
                 protein_selection=protein_selection,
                 nucleic_selection=nucleic_selection,
                 n_jobs=n_jobs,
-                motif_residues=motif_residues
+                motif_residues=motif_residues,
+                reference_sequence=self.reference_sequence if apply_offset else None  # Only pass reference if offset enabled
             )
         
         # Retrieve motif scores if motif was provided

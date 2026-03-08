@@ -15,14 +15,18 @@ class DistanceMetrics:
     """Collection of distance metric computation methods"""
     
     @staticmethod
-    def _process_structure_contacts(pdb_file, distance_cutoff, protein_selection, nucleic_selection, motif_residues=None):
+    def _process_structure_contacts(pdb_file, distance_cutoff, protein_selection, nucleic_selection, motif_residues=None, residue_offset=0):
         """
         Helper function to process a single structure for contact detection.
         Used for parallel processing.
         
-        SMART LOGIC:
+        MOTIF SCREENING:
         - If motif_residues provided: Quick motif contact screening (local search, fast)
-        - If no motif: SASA pre-screening to filter non-interacting poses (global search optimization)
+        - If no motif: Process all protein-nucleic contacts
+        
+        RESIDUE OFFSET CORRECTION:
+        - For chopped AlphaFold models, residue numbers in PDB don't match full-length positions
+        - residue_offset is added to all protein residue numbers to correct this
         
         Parameters:
         -----------
@@ -30,11 +34,14 @@ class DistanceMetrics:
             Dict mapping chain_id -> list of residue numbers
             Example: {'A': [10, 11, 12], 'B': [30, 31, 32]}
             If provided, structures with no motif contacts are filtered out
+        residue_offset : int
+            Offset to add to protein residue numbers (for chopped sequences)
+            Example: if PDB has residues 1-100 but they're actually 501-600, offset=500
         
         Returns:
         --------
         tuple : (contact_set, contact_list)
-            Returns (set(), []) if filtering fails (off-target or non-interacting)
+            Returns (set(), []) if filtering fails (off-target)
         """
         try:
             # Load structure with MDTraj
@@ -48,9 +55,7 @@ class DistanceMetrics:
             if len(protein_atoms) == 0 or len(nucleic_atoms) == 0:
                 return set(), []
             
-            # SMART LOGIC: Different screening strategies based on motif presence
-            
-            # STRATEGY 1: MOTIF SCREENING (local search - fast)
+            # MOTIF SCREENING (if provided)
             if motif_residues is not None and len(motif_residues) > 0:
                 # Build selection for motif residues only
                 motif_atom_indices = []
@@ -71,68 +76,7 @@ class DistanceMetrics:
                             # OFF-TARGET: Motif makes no contact, skip this pose entirely
                             return set(), []
             
-            # STRATEGY 2: SASA SCREENING (global search - filter non-interacting poses)
-            else:
-                # No motif provided - use SASA to filter out non-interacting poses
-                # This is much faster than full contact search for finding interfaces
-                import freesasa
-                import MDAnalysis as mda
-                
-                try:
-                    # Quick SASA check: compute total delta_sasa
-                    freesasa.setVerbosity(freesasa.silent)
-                    
-                    # Load with MDAnalysis for separation
-                    u = mda.Universe(pdb_file)
-                    
-                    # Compute complex SASA
-                    structure_complex = freesasa.Structure(pdb_file)
-                    params = freesasa.Parameters()
-                    params.setProbeRadius(1.4)
-                    result_complex = freesasa.calc(structure_complex, params)
-                    sasa_complex = result_complex.totalArea()
-                    
-                    # Extract and compute isolated components (in-memory, fast)
-                    import tempfile
-                    import os
-                    with tempfile.NamedTemporaryFile(mode='w', suffix='_protein.pdb', delete=False) as tmp_prot:
-                        protein_pdb = tmp_prot.name
-                        u.select_atoms('protein').write(protein_pdb)
-                    
-                    with tempfile.NamedTemporaryFile(mode='w', suffix='_nucleic.pdb', delete=False) as tmp_nuc:
-                        nucleic_pdb = tmp_nuc.name
-                        u.select_atoms('nucleic').write(nucleic_pdb)
-                    
-                    try:
-                        structure_protein = freesasa.Structure(protein_pdb)
-                        result_protein = freesasa.calc(structure_protein, params)
-                        sasa_protein = result_protein.totalArea()
-                        
-                        structure_nucleic = freesasa.Structure(nucleic_pdb)
-                        result_nucleic = freesasa.calc(structure_nucleic, params)
-                        sasa_nucleic = result_nucleic.totalArea()
-                        
-                        # Calculate delta SASA
-                        delta_sasa = (sasa_protein + sasa_nucleic) - sasa_complex
-                        
-                        # FILTER: If delta_sasa < 0.01 Å², no meaningful interaction - skip
-                        if delta_sasa < 0.01:
-                            return set(), []  # Non-interacting pose, filtered out
-                    
-                    finally:
-                        # Cleanup temp files
-                        try:
-                            os.unlink(protein_pdb)
-                            os.unlink(nucleic_pdb)
-                        except:
-                            pass
-                
-                except Exception as sasa_error:
-                    # If SASA fails for any reason, proceed with contact search
-                    # (better to include potentially bad pose than lose good data)
-                    pass
-            
-            # FULL CONTACT SEARCH: Either motif passed screening, or SASA passed threshold, or no filtering
+            # FULL CONTACT SEARCH: Process all protein-nucleic contacts
             # Create all possible atom pairs
             pairs = np.array([(p, n) for p in protein_atoms for n in nucleic_atoms])
             
@@ -154,8 +98,15 @@ class DistanceMetrics:
                 p_res = topology.atom(p_idx).residue
                 n_res = topology.atom(n_idx).residue
                 
+                # Apply residue offset for chopped AlphaFold models (only to protein chain A)
+                # This corrects residue numbering to match full-length sequence positions
+                if p_res.chain.chain_id == 'A':
+                    corrected_resnum = p_res.resSeq + residue_offset
+                else:
+                    corrected_resnum = p_res.resSeq
+                
                 # CRITICAL: Include chain ID to distinguish different chains and L-R symmetry
-                protein_res_id = f"{p_res.chain.chain_id}:{p_res.name}{p_res.resSeq}"
+                protein_res_id = f"{p_res.chain.chain_id}:{p_res.name}{corrected_resnum}"
                 nucleic_res_id = f"{n_res.chain.chain_id}:{n_res.name}{n_res.resSeq}"
                 
                 # Get distance for this contact (convert nm to Å)
@@ -351,12 +302,18 @@ class DistanceMetrics:
     def compute_jaccard_matrix(pdb_files, distance_cutoff=4.5, 
                               protein_selection='protein', 
                               nucleic_selection='nucleic',
-                              n_jobs=1, motif_residues=None):
+                              n_jobs=1, motif_residues=None, reference_sequence=None):
         """
         Compute Jaccard distance matrix based on protein-DNA interface contacts
         
         Key insight: Compares protein residues in contact, NOT residue pairs.
         This makes binding modes comparable even with different DNA sequences.
+        
+        RESIDUE OFFSET CORRECTION (for chopped AlphaFold models):
+        - Parses AlphaFold filename to extract receptor start position
+        - Optionally validates against reference sequence via alignment
+        - Applies offset to all protein residue numbers before Jaccard comparison
+        - This ensures "residue 5" means the same position across all structures
         
         PERFORMANCE OPTIMIZED:
         - Step 0: Motif screening (optional) - filters off-target poses before full contact search
@@ -379,30 +336,67 @@ class DistanceMetrics:
             Dict mapping chain_id -> list of residue numbers for motif screening
             Example: {'A': [10, 11, 12], 'B': [30, 31, 32]}
             If provided, poses with no motif contacts are filtered out (marked as off-target)
+        reference_sequence : str, optional
+            Reference full-length amino acid sequence (single-letter codes)
+            Used to validate/correct residue numbering for chopped AlphaFold models
         
         Returns:
         --------
-        tuple : (distance_matrix, contact_sets, contact_residue_pairs)
+        tuple : (distance_matrix, contact_sets, contact_residue_pairs, pdb_files_filtered, filtered_indices)
         """
         n = len(pdb_files)
         print(f"Computing Jaccard contact distance matrix (cutoff={distance_cutoff} Å)...")
+        
+        # STEP 0: Compute residue offsets for chopped AlphaFold models
+        from core.io_utils import validate_and_correct_residue_offset
+        residue_offsets = []
+        offset_cache = {}
+        
+        if reference_sequence:
+            print(f"  📏 RESIDUE CORRECTION: Validating residue numbering against reference sequence")
+            print(f"  → Reference length: {len(reference_sequence)} residues")
+        
+        for pdb_file in pdb_files:
+            offset_info = validate_and_correct_residue_offset(
+                pdb_file, 
+                reference_sequence=reference_sequence,
+                cache=offset_cache
+            )
+            residue_offsets.append(offset_info['offset'])
+            
+            # Log validation results for debugging
+            if reference_sequence and offset_info.get('validated'):
+                method = offset_info.get('method', 'unknown')
+                identity = offset_info.get('identity', 0)
+                if method == 'alignment' and identity < 95:
+                    print(f"  ⚠️  Low identity ({identity:.1f}%) for {os.path.basename(pdb_file)}")
+        
+        # Summary of offset corrections
+        unique_offsets = set(residue_offsets)
+        if len(unique_offsets) > 1:
+            print(f"  ✓ Applied {len(unique_offsets)} different offsets across structures")
+        elif list(unique_offsets)[0] != 0:
+            print(f"  ✓ Applied uniform offset of +{list(unique_offsets)[0]} residues")
+        else:
+            print(f"  → No offset correction needed (all structures start at residue 1)")
+        
         if motif_residues:
             print(f"  🎯 MOTIF MODE: Motif screening enabled")
             print(f"  → Off-target poses (no motif contact) will be filtered")
         else:
-            print(f"  🌍 GLOBAL MODE: SASA pre-screening enabled")
-            print(f"  → Non-interacting poses (ΔSASA < 0.01 Ų) will be filtered")
+            print(f"  🌍 GLOBAL MODE: Processing all protein-nucleic contacts")
         print(f"Step 1/2: Computing interface contacts for all structures...")
         if n_jobs != 1:
             print(f"  Using {n_jobs} parallel jobs for contact detection")
         
         # STEP 1: Parallel contact detection (I/O bound - benefits from parallelization)
         # With optional motif screening to filter off-target poses
+        # Pass residue offsets for chopped AlphaFold model correction
         results = Parallel(n_jobs=n_jobs, verbose=5 if n_jobs != 1 else 0)(
             delayed(DistanceMetrics._process_structure_contacts)(
-                pdb_file, distance_cutoff, protein_selection, nucleic_selection, motif_residues
+                pdb_file, distance_cutoff, protein_selection, nucleic_selection, motif_residues, offset
             )
-            for pdb_file in pdb_files
+            for pdb_file, offset in zip(pdb_files, residue_offsets)
         )
         
         # Unpack results

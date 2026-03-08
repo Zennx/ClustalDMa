@@ -1,19 +1,22 @@
-# 🧬 ClustalDM - Interactive HDOCK Clustering Analysis
+# 🧬 ClustalDM - AlphaFold2 Model Clustering Analysis
 
-An interactive web application for clustering and analyzing HDOCK protein-nucleic acid docking results using DBSCAN and structural RMSD.
+An interactive web application for clustering and analyzing AlphaFold2 protein structure predictions using HDBSCAN and contact-based similarity metrics.
 
 ## ✨ Features
 
 - **Interactive Web Interface**: User-friendly Shiny app for parameter tuning
-- **Real-time Clustering**: Adjust DBSCAN parameters and see results instantly
+- **Real-time Clustering**: Adjust HDBSCAN parameters and see results instantly
+- **AlphaFold2 Support**: Automatically reads PDB and mmCIF format models
+- **Reference Model**: Optional reference structure for RMSD superposition
 - **Multiple Visualizations**:
-  - Distance matrix heatmaps
+  - Jaccard contact similarity heatmaps
+  - RMSD distance matrices
   - 2D projections (MDS, PCA, t-SNE)
-  - Hierarchical clustering dendrograms
+  - HDBSCAN condensed trees for cluster stability
   - Cluster size distributions
-- **Quality Metrics**: Silhouette scores and intra-cluster statistics
-- **PyMOL Integration**: Generate PyMOL scripts for visual inspection
-- **Efficient Export**: Save results with optional symbolic links
+- **Quality Metrics**: Intra-cluster RMSD statistics and binding hotspot analysis
+- **Molstar Viewer**: Interactive 3D structure viewing with pLDDT coloring support
+- **Efficient Export**: Save results and cluster PDBs as ZIP archives
 
 ## 🚀 Quick Start
 
@@ -31,53 +34,41 @@ pip install -r requirements.txt
 
 ```bash
 # Option 1: Using the launcher script
-python run_app.py
+./launch_app.sh
 
 # Option 2: Direct shiny command
-shiny run app.py
+shiny run app_main.py
 ```
 
 The app will open in your default browser at `http://127.0.0.1:8000`
-
-### Using the CLI (Original)
-
-```bash
-python clustaldemo.py -d /path/to/HDOCK/output \
-    -s "nucleic and name P" \
-    --no-align \
-    -e 12.0 \
-    -m 2 \
-    -o output_dir \
-    --use-symlinks
-```
 
 ## 📖 Usage Guide
 
 ### Web App Workflow
 
 1. **Input Settings**
-   - Enter your HDOCK output directory path
-   - Specify atom selection (e.g., `nucleic and name P` for DNA phosphate backbone)
-   - Set filename filter (default: `model`)
+   - Enter your AlphaFold2 models directory path
+   - (Optional) Upload a reference model for RMSD calculation
+   - (Optional) Specify motif residues for focused analysis
 
 2. **Clustering Parameters**
-   - Adjust DBSCAN `eps` (distance threshold in Ångströms)
-   - Set `min_samples` (minimum cluster size)
-   - Toggle alignment (disable for docking results)
+   - Adjust HDBSCAN `min_cluster_size` (minimum members per cluster)
+   - Set `min_samples` (noise threshold parameter)
+   - Toggle duplicate filtering for near-identical structures
 
 3. **Run Analysis**
-   - Click "🚀 Run Clustering Analysis"
-   - Wait for processing (progress shown in status panel)
+   - Click "🚀 Run Analysis"
+   - Wait for processing (progress shown in status log)
 
 4. **Explore Results**
-   - **Overview**: Cluster summary and quality metrics
-   - **Distance Matrix**: RMSD heatmap sorted by clusters
-   - **Scatter Plots**: 2D projections with different methods
-   - **Dendrogram**: Hierarchical clustering tree
-   - **Cluster Details**: Examine individual clusters
-   - **Export**: Save all results to disk
+   - **Overview**: Cluster summary cards with key statistics
+   - **Distance Matrices**: Jaccard and RMSD heatmaps
+   - **Interactive Maps**: 2D projections with different dimensionality reduction methods
+   - **Cluster Trees**: HDBSCAN condensed tree and hierarchical linkage visualization
+   - **3D Viewer**: Molstar-based structure visualization
+   - **Export**: Download all results or specific cluster PDBs
 
-### Recommended Settings for HDOCK
+### Recommended Settings for AlphaFold2
 
 - **Selection**: `nucleic and name P` (for DNA/RNA ligand)
 - **No Alignment**: ✅ Checked (preserves docking poses)
