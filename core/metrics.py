@@ -55,8 +55,10 @@ class DistanceMetrics:
             if len(protein_atoms) == 0 or len(nucleic_atoms) == 0:
                 return set(), []
             
-            # MOTIF SCREENING (if provided)
+            # MOTIF SCREENING (if provided) - optimized with KDTree
             if motif_residues is not None and len(motif_residues) > 0:
+                from scipy.spatial import cKDTree
+                
                 # Build selection for motif residues only
                 motif_atom_indices = []
                 for chain_id, residue_nums in motif_residues.items():
@@ -65,73 +67,100 @@ class DistanceMetrics:
                             motif_atom_indices.extend([atom.index for atom in res.atoms])
                 
                 if len(motif_atom_indices) > 0:
-                    # Quick screening: check if ANY motif atom contacts nucleic acid
-                    motif_nucleic_pairs = np.array([(m, n) for m in motif_atom_indices for n in nucleic_atoms])
+                    # Quick screening using spatial search (much faster than all-pairs)
+                    motif_positions = traj.xyz[0, motif_atom_indices, :]
+                    nucleic_positions = traj.xyz[0, nucleic_atoms, :]
                     
-                    if len(motif_nucleic_pairs) > 0:
-                        motif_distances = md.compute_distances(traj, motif_nucleic_pairs)[0]
-                        motif_has_contact = np.any(motif_distances <= (distance_cutoff / 10.0))
-                        
-                        if not motif_has_contact:
-                            # OFF-TARGET: Motif makes no contact, skip this pose entirely
-                            return set(), []
+                    # Build KDTree for nucleic atoms
+                    nucleic_tree = cKDTree(nucleic_positions)
+                    cutoff_nm = distance_cutoff / 10.0
+                    
+                    # Check if ANY motif atom has a neighbor within cutoff
+                    motif_has_contact = False
+                    for motif_pos in motif_positions:
+                        neighbors = nucleic_tree.query_ball_point(motif_pos, r=cutoff_nm)
+                        if len(neighbors) > 0:
+                            motif_has_contact = True
+                            break  # Early termination!
+                    
+                    if not motif_has_contact:
+                        # OFF-TARGET: Motif makes no contact, skip this pose entirely
+                        return set(), []
             
-            # FULL CONTACT SEARCH: Process all protein-nucleic contacts
-            # Create all possible atom pairs
-            pairs = np.array([(p, n) for p in protein_atoms for n in nucleic_atoms])
+            # OPTIMIZED CONTACT SEARCH using spatial indexing (KDTree)
+            # Strategy: Search from smaller set (usually nucleic) to larger set (protein)
+            # This reduces comparisons and enables early termination
             
-            # Compute distances (vectorized)
-            distances = md.compute_distances(traj, pairs)[0]
+            from scipy.spatial import cKDTree
             
-            # Find contacts below cutoff
-            contact_mask = distances <= (distance_cutoff / 10.0)  # Å to nm
-            contact_atom_pairs = pairs[contact_mask]
+            # Get atom positions
+            protein_positions = traj.xyz[0, protein_atoms, :]  # Shape: (n_protein, 3)
+            nucleic_positions = traj.xyz[0, nucleic_atoms, :]  # Shape: (n_nucleic, 3)
             
-            # Convert to protein residue contacts
-            protein_residues_in_contact = set()
-            contact_list = []
+            # Build KDTree for protein atoms (typically larger set = receptor)
+            protein_tree = cKDTree(protein_positions)
+            
+            # Convert cutoff to nm for MDTraj consistency
+            cutoff_nm = distance_cutoff / 10.0
             
             # Track minimum distance for each protein residue
             residue_min_distances = {}
+            protein_residues_in_contact = set()
+            contact_list = []
             
-            for idx, (p_idx, n_idx) in enumerate(contact_atom_pairs):
-                p_res = topology.atom(p_idx).residue
+            # For each nucleic atom (ligand - smaller set), find nearby protein atoms
+            for n_local_idx, n_idx in enumerate(nucleic_atoms):
+                n_pos = nucleic_positions[n_local_idx]
+                
+                # Query KDTree: find all protein atoms within cutoff
+                # Returns indices into protein_atoms array
+                protein_neighbors = protein_tree.query_ball_point(n_pos, r=cutoff_nm)
+                
+                if len(protein_neighbors) == 0:
+                    continue  # No contacts for this nucleic atom
+                
+                # Get nucleic residue info (once per nucleic atom)
                 n_res = topology.atom(n_idx).residue
-                
-                # Apply residue offset for chopped AlphaFold models (only to protein chain A)
-                # This corrects residue numbering to match full-length sequence positions
-                if p_res.chain.chain_id == 'A':
-                    corrected_resnum = p_res.resSeq + residue_offset
-                else:
-                    corrected_resnum = p_res.resSeq
-                
-                # CRITICAL: Include chain ID to distinguish different chains and L-R symmetry
-                protein_res_id = f"{p_res.chain.chain_id}:{p_res.name}{corrected_resnum}"
                 nucleic_res_id = f"{n_res.chain.chain_id}:{n_res.name}{n_res.resSeq}"
                 
-                # Get distance for this contact (convert nm to Å)
-                contact_distance = distances[contact_mask][idx] * 10.0
-                
-                # Track minimum distance for each protein residue
-                if protein_res_id not in residue_min_distances:
-                    residue_min_distances[protein_res_id] = contact_distance
-                else:
-                    residue_min_distances[protein_res_id] = min(residue_min_distances[protein_res_id], contact_distance)
-                
-                # Add to set of protein residues in contact
-                protein_residues_in_contact.add(protein_res_id)
-                
-                # Store full pair for export with distance
-                contact_list.append({
-                    'protein_residue': protein_res_id,
-                    'nucleic_residue': nucleic_res_id,
-                    'protein_res_idx': p_res.index,
-                    'nucleic_res_idx': n_res.index,
-                    'protein_chain': p_res.chain.chain_id,
-                    'nucleic_chain': n_res.chain.chain_id,
-                    'distance': contact_distance,  # Store actual distance in Å
-                    'min_residue_distance': residue_min_distances[protein_res_id]  # Minimum for this protein residue
-                })
+                # Process each contacting protein atom
+                for p_local_idx in protein_neighbors:
+                    p_idx = protein_atoms[p_local_idx]
+                    p_res = topology.atom(p_idx).residue
+                    
+                    # Calculate actual distance (only for contacts, not all pairs!)
+                    distance_nm = np.linalg.norm(protein_positions[p_local_idx] - n_pos)
+                    contact_distance = distance_nm * 10.0  # Convert to Å
+                    
+                    # Apply residue offset for chopped AlphaFold models (only to protein chain A)
+                    if p_res.chain.chain_id == 'A':
+                        corrected_resnum = p_res.resSeq + residue_offset
+                    else:
+                        corrected_resnum = p_res.resSeq
+                    
+                    # CRITICAL: Include chain ID to distinguish different chains and L-R symmetry
+                    protein_res_id = f"{p_res.chain.chain_id}:{p_res.name}{corrected_resnum}"
+                    
+                    # Track minimum distance for each protein residue
+                    if protein_res_id not in residue_min_distances:
+                        residue_min_distances[protein_res_id] = contact_distance
+                    else:
+                        residue_min_distances[protein_res_id] = min(residue_min_distances[protein_res_id], contact_distance)
+                    
+                    # Add to set of protein residues in contact
+                    protein_residues_in_contact.add(protein_res_id)
+                    
+                    # Store full pair for export with distance
+                    contact_list.append({
+                        'protein_residue': protein_res_id,
+                        'nucleic_residue': nucleic_res_id,
+                        'protein_res_idx': p_res.index,
+                        'nucleic_res_idx': n_res.index,
+                        'protein_chain': p_res.chain.chain_id,
+                        'nucleic_chain': n_res.chain.chain_id,
+                        'distance': contact_distance,  # Store actual distance in Å
+                        'min_residue_distance': residue_min_distances[protein_res_id]  # Minimum for this protein residue
+                    })
             
             return protein_residues_in_contact, contact_list
             
