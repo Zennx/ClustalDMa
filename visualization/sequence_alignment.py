@@ -212,7 +212,7 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
         # If reference PDB is provided, extract its DSSP data
         ref_ss = None
         ref_plddt = None
-        if reference_pdb and os.path.exists(reference_pdb):
+        if reference_pdb is not None and os.path.exists(reference_pdb):
             print(f"  Extracting DSSP from reference PDB: {reference_pdb}")
             try:
                 ref_dssp_data = extract_secondary_structure_dssp(reference_pdb, chain_id='A')
@@ -243,7 +243,7 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
         
         # Calculate offset
         aligned_offset = 0
-        if reference_seq:
+        if reference_seq is not None and len(reference_seq) > 0:
             try:
                 alignment = align_sequences(reference_seq, dssp_data['sequence'])
                 if alignment and 'target_start' in alignment:

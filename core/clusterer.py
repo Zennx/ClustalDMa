@@ -138,7 +138,7 @@ class PDBClusterer:
                 nucleic_selection=nucleic_selection,
                 n_jobs=n_jobs,
                 motif_residues=motif_residues,
-                reference_sequence=self.reference_sequence if apply_offset else None  # Only pass reference if offset enabled
+                reference_sequence=self.reference_sequence if (apply_offset and self.reference_sequence) else None  # Only pass reference if offset enabled AND available
             )
         
         # Retrieve motif scores if motif was provided

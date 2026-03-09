@@ -289,7 +289,7 @@ def validate_and_correct_residue_offset(pdb_path, reference_sequence=None, cache
         return result
     
     # If no reference sequence, just use filename offset
-    if reference_sequence is None:
+    if reference_sequence is None or len(reference_sequence) == 0:
         result = {
             'offset': parsed['offset'],
             'method': 'filename',

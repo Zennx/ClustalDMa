@@ -135,13 +135,13 @@ def create_hotspot_histogram(hotspots_df, top_n=None, smooth=True, split_by_chai
     hotspots_df['resnum'] = hotspots_df['residue'].apply(extract_resnum)
     hotspots_df['chain'] = hotspots_df['residue'].apply(extract_chain)
     
-    # Sort by chain, then residue number
-    hotspots_df = hotspots_df.sort_values(['chain', 'resnum'])
+    # Sort by chain, then residue number - CRITICAL: reset_index to avoid misalignment
+    hotspots_df = hotspots_df.sort_values(['chain', 'resnum']).reset_index(drop=True)
     
     # Optionally limit to top N
     if top_n is not None:
         top_residues = hotspots_df.nlargest(top_n, 'percentage')
-        hotspots_df = top_residues.sort_values(['chain', 'resnum'])
+        hotspots_df = top_residues.sort_values(['chain', 'resnum']).reset_index(drop=True)
     
     # Color scheme for chains
     chain_colors = {
@@ -175,8 +175,9 @@ def create_hotspot_histogram(hotspots_df, top_n=None, smooth=True, split_by_chai
                     color=color,
                     line=dict(width=0)
                 ),
-                hovertemplate='<b>%{text}</b><br>Position: %{x}<br>Frequency: %{y:.1f}%<extra></extra>',
+                hovertemplate='<b>%{text}</b><br>Position: %{x}<br>Count: %{customdata[0]}<br>Frequency: %{y:.1f}%<extra></extra>',
                 text=chain_data['residue'],
+                customdata=chain_data[['frequency']].values,
                 name=f'Chain {chain}'
             ))
             
@@ -210,8 +211,9 @@ def create_hotspot_histogram(hotspots_df, top_n=None, smooth=True, split_by_chai
                 color=colors,
                 line=dict(width=0)
             ),
-            hovertemplate='<b>%{text}</b><br>Position: %{x}<br>Frequency: %{y:.1f}%<extra></extra>',
+            hovertemplate='<b>%{text}</b><br>Position: %{x}<br>Count: %{customdata[0]}<br>Frequency: %{y:.1f}%<extra></extra>',
             text=hotspots_df['residue'],
+            customdata=hotspots_df[['frequency']].values,
             name='Binding Frequency'
         ))
         
@@ -510,6 +512,14 @@ def create_scatter_multimethod(df, distance_matrix, method='mds'):
         # print(f"Computing PCA projection (on distance matrix)...")
         pca = PCA(n_components=2, random_state=42)
         coords_2d = pca.fit_transform(distance_matrix)
+    elif method == 'umap':
+        try:
+            from umap import UMAP
+            # print(f"Computing UMAP projection...")
+            reducer = UMAP(n_components=2, metric='precomputed', random_state=42, n_neighbors=min(15, distance_matrix.shape[0]-1))
+            coords_2d = reducer.fit_transform(distance_matrix)
+        except ImportError:
+            raise ImportError("UMAP not installed. Install with: pip install umap-learn")
     else:
         raise ValueError(f"Unknown method: {method}")
     
@@ -564,7 +574,7 @@ def create_scatter_multimethod(df, distance_matrix, method='mds'):
             hovertemplate='%{text}<extra></extra>'
         ))
     
-    method_name = {'mds': 'MDS', 'tsne': 't-SNE', 'pca': 'PCA'}[method]
+    method_name = {'mds': 'MDS', 'tsne': 't-SNE', 'pca': 'PCA', 'umap': 'UMAP'}[method]
     fig.update_layout(
         title=f'Cluster Visualization ({method_name} Projection)',
         xaxis_title=f'{method_name} Component 1',

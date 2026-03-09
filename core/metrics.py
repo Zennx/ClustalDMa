@@ -381,7 +381,7 @@ class DistanceMetrics:
         residue_offsets = []
         offset_cache = {}
         
-        if reference_sequence:
+        if reference_sequence is not None and len(reference_sequence) > 0:
             print(f"  📏 RESIDUE CORRECTION: Validating residue numbering against reference sequence")
             print(f"  → Reference length: {len(reference_sequence)} residues")
         
@@ -394,7 +394,7 @@ class DistanceMetrics:
             residue_offsets.append(offset_info['offset'])
             
             # Log validation results for debugging
-            if reference_sequence and offset_info.get('validated'):
+            if reference_sequence is not None and len(reference_sequence) > 0 and offset_info.get('validated'):
                 method = offset_info.get('method', 'unknown')
                 identity = offset_info.get('identity', 0)
                 if method == 'alignment' and identity < 95:
@@ -409,7 +409,7 @@ class DistanceMetrics:
         else:
             print(f"  → No offset correction needed (all structures start at residue 1)")
         
-        if motif_residues:
+        if motif_residues is not None and len(motif_residues) > 0:
             print(f"  🎯 MOTIF MODE: Motif screening enabled")
             print(f"  → Off-target poses (no motif contact) will be filtered")
         else:
