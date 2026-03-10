@@ -666,6 +666,20 @@ def main():
     print(f"\n💾 Saved cluster summary: {csv_path.name}")
     
     # Save structure assignments
+    structures = [os.path.basename(str(f)) for f in pdb_files]
+    labels = results['labels']
+    probs = results.get('probabilities')
+
+    print("pdb_files:", len(structures))
+    print("labels:", len(labels))
+    probs = results.get('probabilities')
+    print("probabilities:", len(probs) if probs is not None else 0)
+
+    if probs is None or len(probs) != len(labels):
+       probs = [1.0] * len(labels)
+
+    structures = structures[:len(labels)]
+
     assignments_df = pd.DataFrame({
         'structure': [os.path.basename(str(f)) for f in pdb_files],
         'cluster': results['labels'],
