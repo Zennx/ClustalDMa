@@ -562,8 +562,8 @@ app_ui = ui.page_fluid(
             ),
             ui.div(
                 ui.input_file("reference_sequence", "Reference Sequence (optional):", 
-                             accept=[".fasta", ".fa", ".txt", ".pdb"]),
-                ui.tags.small("Upload reference FASTA or PDB for residue number validation/correction (recommended for chopped AlphaFold models)", 
+                             accept=[".fasta", ".fa", ".txt", ".pdb", ".cif"]),
+                ui.tags.small("Upload reference FASTA, PDB, or CIF for residue number validation/correction (recommended for chopped AlphaFold models)", 
                              style="color: #6c757d; display: block; margin-top: 5px; margin-bottom: 10px;"),
                 style="margin-bottom: 10px;"
             ),
@@ -1362,16 +1362,18 @@ def server(input, output, session):
             clust.reference_sequence = None
             clust.reference_pdb = None  # Store PDB path if reference is a PDB
             
-            # Priority 1: Reference sequence file (can be FASTA or PDB)
+            # Priority 1: Reference sequence file (can be FASTA, PDB, or CIF)
             if ref_seq_file and os.path.exists(ref_seq_file):
                 try:
-                    # Check if it's a PDB or FASTA file
-                    if ref_seq_file.lower().endswith('.pdb'):
-                        ref_sequence = extract_sequence_from_pdb(ref_seq_file, chain_id='A')
-                        log_status(f"✓ Reference sequence extracted from PDB: {len(ref_sequence)} residues")
-                        print(f"  Extracted from PDB: {len(ref_sequence)} residues")
+                    # Check if it's a PDB/CIF or FASTA file
+                    if ref_seq_file.lower().endswith(('.pdb', '.cif')):
+                        # Get ligand chain if available (default to 'B')
+                        lig_ch = input.ligand_chain().strip() or 'B'
+                        ref_sequence = extract_sequence_from_pdb(ref_seq_file, ligand_chain=lig_ch)
+                        log_status(f"✓ Reference sequence extracted from structure: {len(ref_sequence)} residues")
+                        print(f"  Extracted from structure (excluding chain {lig_ch}): {len(ref_sequence)} residues")
                         print(f"  First 50 chars: {ref_sequence[:50]}")
-                        # Store PDB path for visualization
+                        # Store structure path for visualization
                         clust.reference_pdb = ref_seq_file
                         print(f"  Stored reference_pdb path: {ref_seq_file}")
                     else:
@@ -1401,9 +1403,10 @@ def server(input, output, session):
                 # Also extract sequence from model if not already done
                 if clust.reference_sequence is None:
                     try:
-                        ref_sequence = extract_sequence_from_pdb(ref_model_file, chain_id='A')
+                        lig_ch = input.ligand_chain().strip() or 'B'
+                        ref_sequence = extract_sequence_from_pdb(ref_model_file, ligand_chain=lig_ch)
                         clust.reference_sequence = ref_sequence
-                        print(f"  Extracted sequence from reference model: {len(ref_sequence)} residues")
+                        print(f"  Extracted sequence from reference model (excluding chain {lig_ch}): {len(ref_sequence)} residues")
                     except Exception as e:
                         print(f"  Could not extract sequence from reference model: {e}")
             
@@ -1420,6 +1423,9 @@ def server(input, output, session):
             # Get ligand chain ID
             ligand_chain = input.ligand_chain().strip() or "B"
             log_status(f"Ligand chain: {ligand_chain}")
+            
+            # Store ligand chain in clusterer for later use
+            clust.ligand_chain = ligand_chain
             
             # STEP 1: Compute Jaccard matrix (chain-aware!)
             log_status("STEP 1: Computing Jaccard contact matrix...")
@@ -1469,7 +1475,8 @@ def server(input, output, session):
             if ref_model and os.path.exists(ref_model):
                 try:
                     # Add reference model to the beginning of universes for superposition
-                    ref_universe = mda.Universe(ref_model)
+                    from core.clusterer import load_universe_with_cif_support
+                    ref_universe = load_universe_with_cif_support(ref_model)
                     log_status(f"  Using reference model for superposition: {os.path.basename(ref_model)}")
                     # We'll use it for alignment but not include in clustering
                 except Exception as e:
@@ -2685,7 +2692,8 @@ def server(input, output, session):
                     clust.labels,
                     reference_pdb=ref_pdb,
                     reference_sequence=ref_seq,
-                    cluster_summary=summary_df
+                    cluster_summary=summary_df,
+                    ligand_chain=clust.ligand_chain if hasattr(clust, 'ligand_chain') else 'B'
                 )
             else:
                 # Within cluster mode
@@ -2698,7 +2706,8 @@ def server(input, output, session):
                 fig = create_alignment_visualization_within_cluster(
                     clust.pdb_files,
                     clust.labels,
-                    cluster_id
+                    cluster_id,
+                    ligand_chain=clust.ligand_chain if hasattr(clust, 'ligand_chain') else 'B'
                 )
             
             # Convert to HTML with explicit config

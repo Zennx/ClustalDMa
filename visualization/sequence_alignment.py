@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 
 
-def extract_secondary_structure_dssp(pdb_path, chain_id='A'):
+def extract_secondary_structure_dssp(pdb_path, chain_id='A', ligand_chain=None):
     """
     Extract secondary structure using MDAnalysis DSSP.
     
@@ -18,8 +18,11 @@ def extract_secondary_structure_dssp(pdb_path, chain_id='A'):
     -----------
     pdb_path : str
         Path to PDB file
-    chain_id : str
-        Chain ID to analyze
+    chain_id : str or list
+        Chain ID(s) to analyze (default: 'A')
+        Can be single chain 'A' or list ['A', 'B', 'C'] for multi-chain receptors
+    ligand_chain : str, optional
+        If provided, analyze all protein chains EXCEPT this one (for multi-chain receptors)
     
     Returns:
     --------
@@ -33,18 +36,29 @@ def extract_secondary_structure_dssp(pdb_path, chain_id='A'):
     try:
         import MDAnalysis as mda
         from MDAnalysis.analysis.dssp import DSSP as MDA_DSSP
+        from core.clusterer import load_universe_with_cif_support
         
-        # Load structure
-        u = mda.Universe(pdb_path)
+        # Load structure (support PDB and CIF formats)
+        u = load_universe_with_cif_support(pdb_path)
         
-        # Select protein chain
-        protein = u.select_atoms(f'protein and segid {chain_id}')
+        # Build selection for protein chains
+        if ligand_chain:
+            # Multi-chain receptor: select all protein except ligand
+            protein = u.select_atoms(f'protein and not (chainID {ligand_chain})')
+            print(f"  Multi-chain mode: all protein except chain {ligand_chain}")
+        elif isinstance(chain_id, list):
+            # Multiple specific chains
+            chain_list = ' or '.join([f'chainID {c}' for c in chain_id])
+            protein = u.select_atoms(f'protein and ({chain_list})')
+            print(f"  Multi-chain mode: chains {chain_id}")
+        else:
+            # Single chain - try segid first, then chainID
+            protein = u.select_atoms(f'protein and segid {chain_id}')
+            if len(protein) == 0:
+                protein = u.select_atoms(f'protein and chainID {chain_id}')
+        
         if len(protein) == 0:
-            # Try without segid (some PDBs use chainID)
-            protein = u.select_atoms(f'protein and chainID {chain_id}')
-        
-        if len(protein) == 0:
-            print(f"Warning: Chain {chain_id} not found, using all protein atoms")
+            print(f"Warning: Specified chain(s) not found, using all protein atoms")
             protein = u.select_atoms('protein')
         
         # Run DSSP
@@ -155,7 +169,7 @@ def extract_sequence_and_plddt_fallback(pdb_path, chain_id='A'):
     }
 
 
-def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None, reference_sequence=None, cluster_summary=None):
+def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None, reference_sequence=None, cluster_summary=None, ligand_chain='B'):
     """
     Create sequence alignment visualization comparing cluster medoids.
     
@@ -215,7 +229,7 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
         if reference_pdb and os.path.exists(reference_pdb):
             print(f"  Extracting DSSP from reference PDB: {reference_pdb}")
             try:
-                ref_dssp_data = extract_secondary_structure_dssp(reference_pdb, chain_id='A')
+                ref_dssp_data = extract_secondary_structure_dssp(reference_pdb, ligand_chain=ligand_chain)
                 if ref_dssp_data:
                     ref_ss = ref_dssp_data['ss']
                     ref_plddt = ref_dssp_data['plddt']
@@ -236,9 +250,9 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
     # Extract data for each medoid (in parallel for speed)
     from concurrent.futures import ProcessPoolExecutor, as_completed
     
-    def extract_medoid_data(cluster_id, pdb_path, reference_seq):
+    def extract_medoid_data(cluster_id, pdb_path, reference_seq, lig_ch):
         """Extract DSSP data for a single medoid"""
-        dssp_data = extract_secondary_structure_dssp(pdb_path, chain_id='A')
+        dssp_data = extract_secondary_structure_dssp(pdb_path, ligand_chain=lig_ch)
         filename_info = parse_alphafold_filename(os.path.basename(pdb_path))
         
         # Calculate offset
@@ -285,7 +299,7 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all jobs
         future_to_cluster = {
-            executor.submit(extract_medoid_data, cluster_id, pdb_path, reference_sequence): cluster_id
+            executor.submit(extract_medoid_data, cluster_id, pdb_path, reference_sequence, ligand_chain): cluster_id
             for cluster_id, pdb_path in medoid_jobs
         }
         
@@ -484,7 +498,7 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
         })
     
     return fig
-def create_alignment_visualization_within_cluster(pdb_files, labels, cluster_id, reference_pdb=None):
+def create_alignment_visualization_within_cluster(pdb_files, labels, cluster_id, reference_pdb=None, ligand_chain='B'):
     """
     Create sequence alignment visualization for all structures within a cluster.
     
@@ -524,7 +538,7 @@ def create_alignment_visualization_within_cluster(pdb_files, labels, cluster_id,
     
     for idx in cluster_indices:
         pdb_path = pdb_files[idx]
-        dssp_data = extract_secondary_structure_dssp(pdb_path, chain_id='A')
+        dssp_data = extract_secondary_structure_dssp(pdb_path, ligand_chain=ligand_chain)
         filename_info = parse_alphafold_filename(os.path.basename(pdb_path))
         
         structure_data.append({

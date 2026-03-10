@@ -7,9 +7,54 @@ import numpy as np
 import MDAnalysis as mda
 from sklearn.cluster import DBSCAN
 from scipy.cluster.hierarchy import linkage, fcluster
+import tempfile
 
 from .metrics import DistanceMetrics
 from .analysis import InterfaceAnalyzer
+
+
+def load_universe_with_cif_support(pdb_file):
+    """
+    Load MDAnalysis Universe with support for both PDB and CIF formats.
+    CIF files are converted to PDB on-the-fly using BioPython.
+    
+    Parameters:
+    -----------
+    pdb_file : str or Path
+        Path to structure file (.pdb or .cif)
+    
+    Returns:
+    --------
+    MDAnalysis.Universe
+    """
+    import MDAnalysis as mda
+    
+    file_ext = str(pdb_file).lower()
+    if file_ext.endswith('.cif'):
+        # AlphaFold 3 CIF files - convert to PDB using BioPython
+        from Bio.PDB import MMCIFParser, PDBIO
+        
+        parser = MMCIFParser(QUIET=True)
+        structure = parser.get_structure('structure', pdb_file)
+        
+        # Write to temporary PDB file
+        temp_pdb = tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False)
+        temp_pdb.close()
+        
+        io = PDBIO()
+        io.set_structure(structure)
+        io.save(temp_pdb.name)
+        
+        # Load the converted PDB
+        u = mda.Universe(temp_pdb.name)
+        
+        # Clean up temp file
+        os.unlink(temp_pdb.name)
+        
+        return u
+    else:
+        # Standard PDB files
+        return mda.Universe(pdb_file)
 
 
 class PDBClusterer:
@@ -53,13 +98,13 @@ class PDBClusterer:
         print(f"Found {self.n_structures} PDB files")
     
     def load_structures(self):
-        """Load all PDB structures using MDAnalysis"""
+        """Load all PDB structures using MDAnalysis (supports PDB, CIF/mmCIF via BioPython conversion)"""
         print("Loading structures...")
         self.universes = []
         
         for pdb_file in self.pdb_files:
             try:
-                u = mda.Universe(pdb_file)
+                u = load_universe_with_cif_support(pdb_file)
                 self.universes.append(u)
             except Exception as e:
                 print(f"Warning: Could not load {pdb_file}: {e}")

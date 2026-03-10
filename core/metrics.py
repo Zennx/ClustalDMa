@@ -186,8 +186,11 @@ class DistanceMetrics:
         i, j, pdb_i, pdb_j, selection, do_align = args
         try:
             # Load universes fresh in each worker (avoids pickling overhead)
-            u1 = mda.Universe(pdb_i)
-            u2 = mda.Universe(pdb_j)
+            # Support both PDB and CIF/mmCIF formats (AlphaFold 3)
+            from .clusterer import load_universe_with_cif_support
+            
+            u1 = load_universe_with_cif_support(pdb_i)
+            u2 = load_universe_with_cif_support(pdb_j)
             
             # Align if requested (but usually we don't for nucleic P atoms)
             if do_align:
