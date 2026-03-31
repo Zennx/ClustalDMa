@@ -275,9 +275,10 @@ class InterfaceAnalyzer:
         import MDAnalysis as mda
         import freesasa
         import os
+        from .clusterer import load_universe_with_cif_support
         
-        # Load structure
-        u = mda.Universe(pdb_file)
+        # Load structure (support PDB and CIF formats)
+        u = load_universe_with_cif_support(pdb_file)
         
         # Setup FreeSASA parameters
         params = freesasa.Parameters()
@@ -455,7 +456,8 @@ class InterfaceAnalyzer:
         else:
             # Fallback: Auto-detect from PDB (less reliable for mixed chains)
             print("   ⚠️ No contact data - attempting auto-detection")
-            u = mda.Universe(pdb_file)
+            from .clusterer import load_universe_with_cif_support
+            u = load_universe_with_cif_support(pdb_file)
             
             # Nucleic acid residues
             nucleic_resnames = ['DA', 'DT', 'DG', 'DC', 'A', 'U', 'G', 'C', 

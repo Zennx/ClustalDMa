@@ -88,16 +88,19 @@ def read_fasta_sequence(fasta_path):
     return ''.join(sequence)
 
 
-def extract_sequence_from_pdb(pdb_path, chain_id='A'):
+def extract_sequence_from_pdb(pdb_path, chain_id='A', ligand_chain=None):
     """
     Extract amino acid sequence from PDB file for a specific chain.
     
     Parameters:
     -----------
     pdb_path : str
-        Path to PDB file
-    chain_id : str
-        Chain ID to extract (default: 'A' for receptor)
+        Path to PDB/CIF file
+    chain_id : str or list
+        Chain ID(s) to extract (default: 'A' for single receptor chain)
+        Can be a single chain like 'A' or list like ['A', 'B', 'C']
+    ligand_chain : str, optional
+        If provided, extract all protein chains EXCEPT this one (for multi-chain receptors)
     
     Returns:
     --------
@@ -116,9 +119,21 @@ def extract_sequence_from_pdb(pdb_path, chain_id='A'):
     }
     
     try:
-        u = mda.Universe(pdb_path)
-        # Select protein residues from specified chain
-        selection = u.select_atoms(f"protein and chainID {chain_id}")
+        # Load structure (support PDB and CIF formats)
+        from .clusterer import load_universe_with_cif_support
+        u = load_universe_with_cif_support(pdb_path)
+        
+        # Build selection string
+        if ligand_chain:
+            # Multi-chain receptor: select all protein except ligand chain
+            selection = u.select_atoms(f"protein and not (chainID {ligand_chain})")
+        elif isinstance(chain_id, list):
+            # Multiple specific chains
+            chain_list = ' or '.join([f'chainID {c}' for c in chain_id])
+            selection = u.select_atoms(f"protein and ({chain_list})")
+        else:
+            # Single chain
+            selection = u.select_atoms(f"protein and chainID {chain_id}")
         
         # Get unique residues in order
         residues = selection.residues

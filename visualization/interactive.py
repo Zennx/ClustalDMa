@@ -274,12 +274,19 @@ def create_molstar_viewer_html(pdb_file, width=800, height=600,
     import os
     import json
     
-    # Read PDB file and encode
+    # Detect file format (PDB or CIF)
+    file_ext = str(pdb_file).lower()
+    if file_ext.endswith('.cif'):
+        file_format = 'mmcif'
+        print(f"Building Molstar viewer for CIF file: cartoon with pLDDT coloring")
+    else:
+        file_format = 'pdb'
+        print(f"Building Molstar viewer for PDB file: cartoon with pLDDT coloring")
+    
+    # Read structure file and encode
     with open(pdb_file, 'r') as f:
         pdb_data = f.read()
     pdb_base64 = base64.b64encode(pdb_data.encode()).decode()
-    
-    print(f"Building Molstar viewer: cartoon with pLDDT coloring")
     
     
     # Build HTML with Molstar and custom preset
@@ -380,7 +387,7 @@ def create_molstar_viewer_html(pdb_file, width=800, height=600,
                     label: 'Structure'
                 }});
                 
-                const trajectory = await actualPlugin.builders.structure.parseTrajectory(data, 'pdb');
+                const trajectory = await actualPlugin.builders.structure.parseTrajectory(data, '{file_format}');
                 const model = await actualPlugin.builders.structure.createModel(trajectory);
                 const structure = await actualPlugin.builders.structure.createStructure(model);
                 

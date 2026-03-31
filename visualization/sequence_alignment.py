@@ -10,7 +10,85 @@ import os
 from pathlib import Path
 
 
-def extract_secondary_structure_dssp(pdb_path, chain_id='A'):
+def is_alphafold_file(structure_path):
+    """
+    Heuristic check whether a structure file is from AlphaFold.
+    Used to decide whether B-factor column should be treated/displayed as pLDDT.
+    """
+    if not structure_path:
+        return False
+
+    filename = os.path.basename(str(structure_path)).lower()
+    if (
+        'alphafold' in filename
+        or 'af2' in filename
+        or 'af3' in filename
+        or filename.startswith('af-')
+        or 'ranked_' in filename
+        or 'unrelaxed' in filename
+        or 'relaxed' in filename
+    ):
+        return True
+
+    # Fallback to project parser if available
+    try:
+        from core.io_utils import parse_alphafold_filename
+        return parse_alphafold_filename(filename) is not None
+    except Exception:
+        return False
+
+
+def get_protein_chains(pdb_path, ligand_chain=None):
+    """
+    Get list of protein chain IDs from a structure file.
+    
+    Parameters:
+    -----------
+    pdb_path : str
+        Path to PDB/CIF file
+    ligand_chain : str, optional
+        Chain to exclude (e.g., ligand chain)
+    
+    Returns:
+    --------
+    list : Chain IDs of protein chains
+    """
+    from Bio.PDB import PDBParser, MMCIFParser
+    
+    try:
+        # Use appropriate parser
+        if str(pdb_path).lower().endswith('.cif'):
+            parser = MMCIFParser(QUIET=True)
+        else:
+            parser = PDBParser(QUIET=True)
+        
+        structure = parser.get_structure('protein', pdb_path)
+        model = structure[0]
+        
+        # Standard amino acids
+        aa_codes = {
+            'ALA', 'CYS', 'ASP', 'GLU', 'PHE', 'GLY', 'HIS', 'ILE',
+            'LYS', 'LEU', 'MET', 'ASN', 'PRO', 'GLN', 'ARG', 'SER',
+            'THR', 'VAL', 'TRP', 'TYR', 'MSE'
+        }
+        
+        protein_chains = []
+        for chain in model.get_chains():
+            if ligand_chain and chain.id == ligand_chain:
+                continue
+            # Check if chain has protein residues
+            has_protein = any(res.resname.strip() in aa_codes and res.id[0] == ' ' 
+                            for res in chain)
+            if has_protein:
+                protein_chains.append(chain.id)
+        
+        return protein_chains
+    except Exception as e:
+        print(f"Warning: Could not extract chain info from {pdb_path}: {e}")
+        return []
+
+
+def extract_secondary_structure_dssp(pdb_path, chain_id='A', ligand_chain=None):
     """
     Extract secondary structure using MDAnalysis DSSP.
     
@@ -18,8 +96,11 @@ def extract_secondary_structure_dssp(pdb_path, chain_id='A'):
     -----------
     pdb_path : str
         Path to PDB file
-    chain_id : str
-        Chain ID to analyze
+    chain_id : str or list
+        Chain ID(s) to analyze (default: 'A')
+        Can be single chain 'A' or list ['A', 'B', 'C'] for multi-chain receptors
+    ligand_chain : str, optional
+        If provided, analyze all protein chains EXCEPT this one (for multi-chain receptors)
     
     Returns:
     --------
@@ -31,91 +112,174 @@ def extract_secondary_structure_dssp(pdb_path, chain_id='A'):
     }
     """
     try:
-        import MDAnalysis as mda
-        from MDAnalysis.analysis.dssp import DSSP as MDA_DSSP
+        # Check if DSSP executable is available
+        import shutil
+        dssp_exe = shutil.which('mkdssp') or shutil.which('dssp')
         
-        # Load structure
-        u = mda.Universe(pdb_path)
-        
-        # Select protein chain
-        protein = u.select_atoms(f'protein and segid {chain_id}')
-        if len(protein) == 0:
-            # Try without segid (some PDBs use chainID)
-            protein = u.select_atoms(f'protein and chainID {chain_id}')
-        
-        if len(protein) == 0:
-            print(f"Warning: Chain {chain_id} not found, using all protein atoms")
-            protein = u.select_atoms('protein')
-        
-        # Run DSSP
-        dssp = MDA_DSSP(protein).run()
-        
-        # Extract data per residue
-        sequence = []
-        ss_codes = []
-        residue_numbers = []
-        plddt_values = []
-        
-        # DSSP results can be 2D array with shape (1, n_residues) or 1D with shape (n_residues,)
-        # Flatten to 1D first
-        dssp_array = dssp.results.dssp.flatten() if hasattr(dssp.results.dssp, 'flatten') else dssp.results.dssp
-        
-        # Convert DSSP array to string (MDAnalysis returns array of characters)
-        # Join all characters into a single string for easy indexing
-        dssp_string = "".join(dssp_array)
-        print(f"  Extracted DSSP: {len(dssp_string)} residues, first 30: '{dssp_string[:30]}...'")
-        print(f"  DSSP string length: {len(dssp_string)}")
-        
-        for res_idx, residue in enumerate(protein.residues):
-            # Get amino acid (1-letter code)
-            aa = residue.resname
-            aa_map = {
-                'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
-                'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
-                'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
-                'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y'
-            }
-            aa_letter = aa_map.get(aa, 'X')
+        if dssp_exe:
+            # Try BioPython DSSP first (more accurate - preserves H/G/I distinction)
+            print(f"  Using BioPython DSSP (found: {dssp_exe})")
+            from Bio.PDB import PDBParser, MMCIFParser, DSSP as BioDSSP
             
-            # Get secondary structure from DSSP string
-            if res_idx < len(dssp_string):
-                ss = dssp_string[res_idx]
-                if not ss or ss == '':
-                    ss = '-'
+            # Use appropriate parser
+            if str(pdb_path).lower().endswith('.cif'):
+                parser = MMCIFParser(QUIET=True)
             else:
-                ss = '-'
+                parser = PDBParser(QUIET=True)
             
-            # Get B-factor (pLDDT) - average over all atoms in residue
-            bfactors = residue.atoms.tempfactors
-            avg_bfactor = np.mean(bfactors) if len(bfactors) > 0 else 0.0
+            structure = parser.get_structure('protein', pdb_path)
+            model = structure[0]
             
-            sequence.append(aa_letter)
-            ss_codes.append(ss)
-            residue_numbers.append(residue.resnum)
-            plddt_values.append(avg_bfactor)
-        
-        return {
-            'sequence': ''.join(sequence),
-            'ss': ss_codes,
-            'residue_numbers': residue_numbers,
-            'plddt': plddt_values
-        }
+            # Run BioPython DSSP
+            dssp = BioDSSP(model, pdb_path)
+            
+            # Extract data
+            sequence = []
+            ss_codes = []
+            residue_numbers = []
+            plddt_values = []
+            
+            aa_codes = {
+                'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E',
+                'PHE': 'F', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
+                'LYS': 'K', 'LEU': 'L', 'MET': 'M', 'ASN': 'N',
+                'PRO': 'P', 'GLN': 'Q', 'ARG': 'R', 'SER': 'S',
+                'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y',
+                'MSE': 'M'
+            }
+            
+            # Determine which chains to process
+            if ligand_chain:
+                chains_to_process = [ch for ch in model.get_chains() if ch.id != ligand_chain]
+            elif isinstance(chain_id, list):
+                chains_to_process = [model[ch] for ch in chain_id if ch in model]
+            else:
+                # Single chain - try segid first, then chainID
+                if chain_id in model:
+                    chains_to_process = [model[chain_id]]
+                else:
+                    chains_to_process = list(model.get_chains())[:1]
+            
+            chain_ids = []  # Track which chain each residue belongs to
+            
+            for chain in chains_to_process:
+                for residue in chain:
+                    if residue.id[0] == ' ':  # Standard residue
+                        dssp_key = (chain.id, residue.id)
+                        if dssp_key in dssp:
+                            ss_code = dssp[dssp_key][2]  # Secondary structure code (H/G/I/E/B/T/S/C/-)
+                            resname = residue.resname.strip()
+                            if resname in aa_codes:
+                                sequence.append(aa_codes[resname])
+                                ss_codes.append(ss_code)
+                                residue_numbers.append(residue.id[1])
+                                chain_ids.append(chain.id)  # Track chain ID
+                                # Get B-factor from DSSP or atoms
+                                bfactors = [atom.get_bfactor() for atom in residue.get_atoms()]
+                                plddt_values.append(np.mean(bfactors) if bfactors else 0.0)
+            
+            print(f"  ✓ BioPython DSSP: {len(sequence)} residues, first 30 SS: {''.join(ss_codes[:30])}...")
+            return {
+                'sequence': ''.join(sequence),
+                'ss': ss_codes,
+                'residue_numbers': residue_numbers,
+                'plddt': plddt_values,
+                'chain_ids': chain_ids
+            }
+        else:
+            # DSSP executable not found, skip to MDAnalysis
+            print(f"  DSSP executable not found, using MDAnalysis (note: lumps H/G/I together)")
+            raise FileNotFoundError("mkdssp not available")
     
-    except Exception as e:
-        print(f"Warning: MDAnalysis DSSP failed for {pdb_path}: {e}")
-        import traceback
-        traceback.print_exc()
-        # Fallback: extract sequence and B-factors without DSSP
-        return extract_sequence_and_plddt_fallback(pdb_path, chain_id)
+    except Exception as bio_e:
+        # BioPython DSSP failed or not available, try MDAnalysis DSSP
+        if not isinstance(bio_e, FileNotFoundError):
+            print(f"  BioPython DSSP failed: {bio_e}")
+        print(f"  Trying MDAnalysis DSSP...")
+        try:
+            from MDAnalysis import Universe
+            from MDAnalysis.analysis.dssp import DSSP as MDA_DSSP
+            u = Universe(str(pdb_path))
+            
+            # Select protein atoms, excluding ligand chain if specified
+            if ligand_chain:
+                protein = u.select_atoms(f'protein and not (chainID {ligand_chain})')
+            else:
+                protein = u.select_atoms('protein')
+            
+            dssp = MDA_DSSP(protein).run()
+            
+            # Extract sequence and secondary structure
+            sequence = []
+            ss_codes = []
+            residue_numbers = []
+            plddt_values = []
+            chain_ids = []  # Track chain IDs
+            
+            for residue in protein.residues:
+                sequence.append(residue.resname)
+                residue_numbers.append(residue.resnum)
+                chain_id = getattr(residue, 'segid', '')
+                if not chain_id:
+                    chain_id = getattr(residue, 'chainID', '')
+                if not chain_id and hasattr(residue, 'atoms') and len(residue.atoms) > 0:
+                    atom_chain = getattr(residue.atoms[0], 'chainID', '')
+                    atom_segid = getattr(residue.atoms[0], 'segid', '')
+                    chain_id = atom_chain or atom_segid
+                chain_ids.append(chain_id if chain_id else '?')  # Track chain robustly
+                # Get average B-factor (pLDDT) for this residue
+                plddt_values.append(np.mean(residue.atoms.tempfactors))
+            
+            # Convert 3-letter to 1-letter amino acid codes
+            sequence_1letter = []
+            for resname in sequence:
+                aa_map = {
+                    'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E',
+                    'PHE': 'F', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
+                    'LYS': 'K', 'LEU': 'L', 'MET': 'M', 'ASN': 'N',
+                    'PRO': 'P', 'GLN': 'Q', 'ARG': 'R', 'SER': 'S',
+                    'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y',
+                    'MSE': 'M'
+                }
+                sequence_1letter.append(aa_map.get(resname, 'X'))
+            
+            # Get DSSP results
+            ss_array = dssp.results.dssp
+            if len(ss_array) > 0:
+                # DSSP array has one entry per residue
+                for ss_code in ss_array:
+                    ss_codes.append(ss_code if ss_code else 'C')
+            else:
+                ss_codes = ['C'] * len(sequence_1letter)
+            
+            print(f"  ✓ MDAnalysis DSSP: {len(sequence_1letter)} residues, first 30 SS: {''.join(ss_codes[:30])}...")
+            return {
+                'sequence': ''.join(sequence_1letter),
+                'ss': ss_codes,
+                'residue_numbers': residue_numbers,
+                'plddt': plddt_values,
+                'chain_ids': chain_ids
+            }
+        
+        except Exception as mda_e:
+            print(f"Warning: MDAnalysis DSSP failed for {pdb_path}: {mda_e}")
+            print(f"  Using sequence-only fallback...")
+            return extract_sequence_and_plddt_fallback(pdb_path, chain_id, ligand_chain)
 
 
-def extract_sequence_and_plddt_fallback(pdb_path, chain_id='A'):
+def extract_sequence_and_plddt_fallback(pdb_path, chain_id='A', ligand_chain=None):
     """
     Fallback: Extract sequence and pLDDT without DSSP.
+    Supports multi-chain receptors via ligand_chain parameter.
     """
-    from Bio.PDB import PDBParser
+    from Bio.PDB import PDBParser, MMCIFParser
     
-    parser = PDBParser(QUIET=True)
+    # Use appropriate parser based on file extension
+    if str(pdb_path).lower().endswith('.cif'):
+        parser = MMCIFParser(QUIET=True)
+    else:
+        parser = PDBParser(QUIET=True)
+    
     structure = parser.get_structure('protein', pdb_path)
     model = structure[0]
     
@@ -133,15 +297,37 @@ def extract_sequence_and_plddt_fallback(pdb_path, chain_id='A'):
     ss_codes = []
     residue_numbers = []
     plddt_values = []
+    chain_ids = []  # Track chain IDs
     
-    if chain_id in model:
-        for residue in model[chain_id]:
+    # Determine which chains to process
+    if ligand_chain:
+        # Multi-chain receptor: process all PROTEIN chains except ligand
+        # Filter out non-protein chains (ions, waters, small molecules)
+        all_chains = list(model.get_chains())
+        chains_to_process = []
+        for ch in all_chains:
+            if ch.id == ligand_chain:
+                continue
+            # Check if chain has protein residues (standard amino acids)
+            has_protein = any(res.resname.strip() in aa_codes and res.id[0] == ' ' for res in ch)
+            if has_protein:
+                chains_to_process.append(ch)
+    elif isinstance(chain_id, list):
+        # Multiple specific chains
+        chains_to_process = [model[ch] for ch in chain_id if ch in model]
+    else:
+        # Single chain
+        chains_to_process = [model[chain_id]] if chain_id in model else []
+    
+    for chain in chains_to_process:
+        for residue in chain:
             if residue.id[0] == ' ':  # Standard residue
                 resname = residue.resname.strip()
                 if resname in aa_codes:
                     sequence.append(aa_codes[resname])
                     ss_codes.append('-')  # No SS info
                     residue_numbers.append(residue.id[1])
+                    chain_ids.append(chain.id)  # Track chain ID
                     
                     # Get B-factor
                     bfactors = [atom.get_bfactor() for atom in residue.get_atoms()]
@@ -151,11 +337,21 @@ def extract_sequence_and_plddt_fallback(pdb_path, chain_id='A'):
         'sequence': ''.join(sequence),
         'ss': ss_codes,
         'residue_numbers': residue_numbers,
-        'plddt': plddt_values
+        'plddt': plddt_values,
+        'chain_ids': chain_ids
     }
 
 
-def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None, reference_sequence=None, cluster_summary=None):
+def create_alignment_visualization_medoids(
+    pdb_files,
+    labels,
+    reference_pdb=None,
+    reference_sequence=None,
+    cluster_summary=None,
+    ligand_chain='B',
+    reference_is_alphafold=False,
+    protein_chains=None,
+):
     """
     Create sequence alignment visualization comparing cluster medoids.
     
@@ -173,6 +369,12 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
         Reference full-length sequence
     cluster_summary : pd.DataFrame, optional
         Cluster summary with consensus residues
+    protein_chains : list of str, optional
+        Receptor protein chain labels to visualize.
+        If provided, these chains are used directly.
+        If None, fallback behavior uses ligand_chain exclusion.
+    reference_is_alphafold : bool, optional
+        If True, treat reference B-factor as pLDDT in the reference lane.
     
     Returns:
     --------
@@ -212,22 +414,38 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
         # If reference PDB is provided, extract its DSSP data
         ref_ss = None
         ref_plddt = None
+        ref_dssp_data = None
         if reference_pdb is not None and os.path.exists(reference_pdb):
             print(f"  Extracting DSSP from reference PDB: {reference_pdb}")
             try:
-                ref_dssp_data = extract_secondary_structure_dssp(reference_pdb, chain_id='A')
+                if protein_chains:
+                    ref_dssp_data = extract_secondary_structure_dssp(reference_pdb, chain_id=protein_chains)
+                else:
+                    ref_dssp_data = extract_secondary_structure_dssp(reference_pdb, ligand_chain=ligand_chain)
                 if ref_dssp_data:
                     ref_ss = ref_dssp_data['ss']
-                    ref_plddt = ref_dssp_data['plddt']
-                    print(f"  Reference DSSP extracted: ss_len={len(ref_ss)}, plddt_len={len(ref_plddt)}")
+                    if reference_is_alphafold:
+                        ref_plddt = ref_dssp_data['plddt']
+                    else:
+                        ref_plddt = None
+                        print("  Reference marked non-AlphaFold: hiding pLDDT lane")
+                    print(f"  Reference DSSP extracted: ss_len={len(ref_ss)}, plddt_len={len(ref_plddt) if ref_plddt else 0}")
+                    # Check if this is a crystal structure (B-factors likely not pLDDT)
+                    if ref_plddt and len(ref_plddt) > 0:
+                        avg_bfactor = sum(ref_plddt) / len(ref_plddt)
+                        if avg_bfactor < 50:  # Crystal structures typically have B-factors 10-50
+                            print(f"  Note: Reference appears to be crystal structure (avg B-factor={avg_bfactor:.1f})")
+                            print(f"       B-factors shown are thermal factors, not pLDDT confidence")
             except Exception as e:
                 print(f"  Could not extract reference DSSP: {e}")
+                print(f"  Reference will show sequence only (no SS or B-factor data)")
         
         all_data.append({
             'name': 'Reference',
             'sequence': reference_sequence,
             'ss': ref_ss,
             'plddt': ref_plddt,
+            'chain_ids': ref_dssp_data.get('chain_ids') if ref_dssp_data else None,
             'offset': 0
         })
     else:
@@ -236,9 +454,13 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
     # Extract data for each medoid (in parallel for speed)
     from concurrent.futures import ProcessPoolExecutor, as_completed
     
-    def extract_medoid_data(cluster_id, pdb_path, reference_seq):
+    def extract_medoid_data(cluster_id, pdb_path, reference_seq, lig_ch):
         """Extract DSSP data for a single medoid"""
-        dssp_data = extract_secondary_structure_dssp(pdb_path, chain_id='A')
+        # Get combined data for all chains
+        if protein_chains:
+            dssp_data = extract_secondary_structure_dssp(pdb_path, chain_id=protein_chains)
+        else:
+            dssp_data = extract_secondary_structure_dssp(pdb_path, ligand_chain=lig_ch)
         filename_info = parse_alphafold_filename(os.path.basename(pdb_path))
         
         # Calculate offset
@@ -261,6 +483,7 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
             'sequence': dssp_data['sequence'],
             'ss': dssp_data['ss'],
             'plddt': dssp_data['plddt'],
+            'chain_ids': dssp_data.get('chain_ids'),
             'offset': aligned_offset
         }
     
@@ -285,7 +508,7 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all jobs
         future_to_cluster = {
-            executor.submit(extract_medoid_data, cluster_id, pdb_path, reference_sequence): cluster_id
+            executor.submit(extract_medoid_data, cluster_id, pdb_path, reference_sequence, ligand_chain): cluster_id
             for cluster_id, pdb_path in medoid_jobs
         }
         
@@ -293,7 +516,7 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
         for future in as_completed(future_to_cluster):
             cluster_id = future_to_cluster[future]
             try:
-                result = future.result()
+                result = future.result()  # Now returns a single dict again
                 medoid_results.append(result)
                 print(f"Cluster {cluster_id}: seq_len={len(result['sequence'])}, "
                       f"ss_len={len(result['ss']) if result['ss'] else 0}, "
@@ -376,11 +599,21 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
     print(f"  Total clusters with consensus: {len(consensus_by_cluster)}")
     print(f"===================================\n")
     
+    # Plotly constraint: vertical_spacing <= 1 / (rows - 1)
+    # Clamp spacing dynamically for large numbers of rows.
+    if n_rows > 1:
+        max_allowed_spacing = (1.0 / (n_rows - 1)) - 1e-6
+        # Keep spacing small for many rows; large spacing makes lanes unusable
+        base_spacing = 0.012 if n_rows >= 6 else 0.03
+        vertical_spacing = min(base_spacing, max_allowed_spacing)
+    else:
+        vertical_spacing = 0.0
+
     fig = make_subplots(
         rows=n_rows,
         cols=1,
         subplot_titles=[d['name'] for d in all_data],
-        vertical_spacing=0.12,  # Increased spacing to prevent overlap
+        vertical_spacing=vertical_spacing,
         row_heights=[1.0] * n_rows
     )
     
@@ -398,6 +631,7 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
             'sequence': data['sequence'],
             'ss_codes': data['ss'],
             'plddt_values': data['plddt'],
+            'chain_ids': data.get('chain_ids'),  # May be None for reference
             'row': i + 1,
             'offset': data['offset'],
             'reference_length': reference_length,
@@ -414,7 +648,7 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
             executor.submit(
                 generate_sequence_track_data,
                 job['sequence'], job['ss_codes'], job['plddt_values'],
-                job['row'], job['offset'], job['reference_length'],
+                job['chain_ids'], job['row'], job['offset'], job['reference_length'],
                 job['max_span'], job['consensus_residues']
             ): job['row'] for job in track_jobs
         }
@@ -453,9 +687,13 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
     
     # Update all axes
     for i in range(1, len(all_data) + 1):
+        is_last_row = i == len(all_data)
         fig.update_xaxes(
-            title_text="Residue Position", row=i, col=1,
-            showticklabels=True, tickmode='auto'
+            title_text="Residue Position" if is_last_row else None,
+            row=i,
+            col=1,
+            showticklabels=is_last_row,
+            tickmode='auto'
         )
         fig.update_yaxes(
             showticklabels=False, range=[-0.1, 1.1], row=i, col=1
@@ -463,7 +701,7 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
     
     fig.update_layout(
         title='Cluster Medoid Sequence Alignment',
-        height=200 * n_rows,  # Increased height per row for better spacing
+        height=max(500, 95 * n_rows + 120),
         showlegend=False  # No legend needed
     )
     
@@ -484,7 +722,16 @@ def create_alignment_visualization_medoids(pdb_files, labels, reference_pdb=None
         })
     
     return fig
-def create_alignment_visualization_within_cluster(pdb_files, labels, cluster_id, reference_pdb=None):
+
+
+def create_alignment_visualization_within_cluster(
+    pdb_files,
+    labels,
+    cluster_id,
+    reference_pdb=None,
+    protein_chains=None,
+    ligand_chain='B'
+):
     """
     Create sequence alignment visualization for all structures within a cluster.
     
@@ -524,7 +771,10 @@ def create_alignment_visualization_within_cluster(pdb_files, labels, cluster_id,
     
     for idx in cluster_indices:
         pdb_path = pdb_files[idx]
-        dssp_data = extract_secondary_structure_dssp(pdb_path, chain_id='A')
+        if protein_chains:
+            dssp_data = extract_secondary_structure_dssp(pdb_path, chain_id=protein_chains)
+        else:
+            dssp_data = extract_secondary_structure_dssp(pdb_path, ligand_chain=ligand_chain)
         filename_info = parse_alphafold_filename(os.path.basename(pdb_path))
         
         structure_data.append({
@@ -535,17 +785,26 @@ def create_alignment_visualization_within_cluster(pdb_files, labels, cluster_id,
             'ss': dssp_data['ss'],
             'residue_numbers': dssp_data['residue_numbers'],
             'plddt': dssp_data['plddt'],
+            'chain_ids': dssp_data.get('chain_ids'),
             'filename_info': filename_info
         })
     
     # Create figure
     n_structures = len(structure_data)
+    # Plotly constraint: vertical_spacing <= 1 / (rows - 1)
+    if n_structures > 1:
+        max_allowed_spacing = (1.0 / (n_structures - 1)) - 1e-6
+        base_spacing = 0.012 if n_structures >= 6 else 0.03
+        vertical_spacing = min(base_spacing, max_allowed_spacing)
+    else:
+        vertical_spacing = 0.0
+
     fig = make_subplots(
         rows=n_structures,
         cols=1,
         subplot_titles=[f'{s["filename"][:50]}...' if len(s["filename"]) > 50 else s["filename"] 
                        for s in structure_data],
-        vertical_spacing=0.01,
+        vertical_spacing=vertical_spacing,
         row_heights=[1.0] * n_structures
     )
     
@@ -560,19 +819,20 @@ def create_alignment_visualization_within_cluster(pdb_files, labels, cluster_id,
             offset=struct['filename_info']['offset'] if struct['filename_info'] else 0,
             reference_length=0,  # No alignment for within-cluster view
             max_span=0,
-            consensus_residues=None  # No consensus markers in within-cluster view
+            consensus_residues=None,  # No consensus markers in within-cluster view
+            chain_ids=struct.get('chain_ids')
         )
     
     fig.update_layout(
         title=f'Cluster {cluster_id} - All Structures',
-        height=100 * n_structures,
+        height=max(420, 90 * n_structures + 100),
         showlegend=True
     )
     
     return fig
 
 
-def generate_sequence_track_data(sequence, ss_codes, plddt_values, row, offset=0, reference_length=0, max_span=0, consensus_residues=None):
+def generate_sequence_track_data(sequence, ss_codes, plddt_values, chain_ids, row, offset=0, reference_length=0, max_span=0, consensus_residues=None):
     """
     Generate shape/annotation data for a sequence track (parallelizable).
     
@@ -587,6 +847,8 @@ def generate_sequence_track_data(sequence, ss_codes, plddt_values, row, offset=0
         Secondary structure codes (DSSP format)
     plddt_values : list of float or None
         pLDDT confidence scores (0-100)
+    chain_ids : list of str or None
+        Chain IDs for each residue
     row : int
         Subplot row number
     offset : int
@@ -617,25 +879,58 @@ def generate_sequence_track_data(sequence, ss_codes, plddt_values, row, offset=0
     seq_len = len(sequence)
     seq_start = offset + 1
     seq_end = offset + seq_len
-    total_length = reference_length if reference_length > 0 else seq_end
+    # Total length should accommodate both reference AND the current sequence
+    total_length = max(reference_length, seq_end) if reference_length > 0 else seq_end
     
+    # Detect whether this row has meaningful pLDDT values.
+    # If not, collapse the pLDDT lane and show an inline note.
+    has_plddt_data = False
+    if plddt_values is not None and len(plddt_values) > 0:
+        has_plddt_data = any(v is not None for v in plddt_values)
+
+    # Dynamic lane geometry
+    chain_y0, chain_y1 = 0.9, 1.0
+    if has_plddt_data:
+        plddt_y0, plddt_y1 = 0.6, 0.9
+        ss_y0, ss_y1 = 0.33, 0.6
+        aa_y = 0.465
+    else:
+        # Keep SS lane size consistent with rows that have pLDDT
+        # (pLDDT lane is omitted and replaced by note)
+        plddt_y0, plddt_y1 = None, None
+        ss_y0, ss_y1 = 0.33, 0.6
+        aa_y = 0.465
+
     # === BUILD DATA ARRAYS ===
     plddt_array = np.full(total_length, -10.0)
     ss_array = np.full(total_length, -1.0)
     
-    # SS code to numeric mapping
+    # SS code to numeric mapping (DSSP codes) - using distinct integers for distinct colors
+    # H = alpha helix, G = 3-10 helix, I = pi helix
+    # E = extended strand (beta sheet), B = beta bridge
+    # T = turn, S = bend, C = coil, - = no structure
     ss_map = {
-        'H': 1, 'G': 2, 'I': 3, 'E': 4, 'B': 5, 'T': 6, 'S': 7, 'C': 0, '-': 0
+        'H': 1,   # Alpha helix → Red
+        'G': 2,   # 3-10 helix → Orange
+        'I': 3,   # Pi helix → Pink
+        'E': 4,   # Extended strand (beta sheet) → Blue
+        'B': 5,   # Beta bridge → Light blue
+        'T': 6,   # Turn → Green
+        'S': 7,   # Bend → Yellow
+        'C': 0,   # Coil → Gray
+        '-': 0    # No structure → Gray
     }
     
     # Fill in actual sequence data
     for i in range(seq_len):
         pos_idx = seq_start + i - 1
         
-        if plddt_values is not None and i < len(plddt_values):
+        # Bounds check: skip if position is out of range
+        if pos_idx < 0 or pos_idx >= total_length:
+            continue
+        
+        if has_plddt_data and i < len(plddt_values):
             plddt_array[pos_idx] = plddt_values[i]
-        else:
-            plddt_array[pos_idx] = 50
         
         if ss_codes is not None and i < len(ss_codes):
             ss_code = str(ss_codes[i]).strip().upper()
@@ -644,76 +939,118 @@ def generate_sequence_track_data(sequence, ss_codes, plddt_values, row, offset=0
             ss_array[pos_idx] = 0
     
     x_positions = np.arange(1, total_length + 1)
+
+    # Plotly axis refs: first subplot uses "x"/"y" (not "x1"/"y1")
+    xref = 'x' if row == 1 else f'x{row}'
+    yref = 'y' if row == 1 else f'y{row}'
     
     # === GENERATE SHAPES (rectangles) ===
     shapes = []
     
-    # pLDDT rectangles (top half: 0.5-1.0)
-    for x_pos, val in zip(x_positions, plddt_array):
-        if val <= -5:
-            color = 'rgba(180, 180, 180, 0.5)'
-        elif val < 50:
-            color = 'rgba(255, 125, 69, 0.8)'
-        elif val < 70:
-            color = 'rgba(255, 219, 19, 0.8)'
-        elif val < 90:
-            color = 'rgba(101, 203, 243, 0.8)'
-        else:
-            color = 'rgba(0, 83, 214, 0.8)'
-        
-        shapes.append(dict(
-            type="rect", xref=f"x{row}", yref=f"y{row}",
-            x0=x_pos - 0.5, y0=0.5, x1=x_pos + 0.5, y1=1.0,
-            fillcolor=color, line=dict(width=0)
-        ))
+    # Chain ID lane (top: 0.9-1.0) - only show where we have actual sequence data
+    chain_color_map = {
+        'A': 'rgba(100, 150, 255, 0.7)', 
+        'B': 'rgba(255, 150, 100, 0.7)',
+        'C': 'rgba(100, 255, 150, 0.7)',
+        'D': 'rgba(255, 100, 255, 0.7)'
+    }
+    if chain_ids:
+        for i in range(seq_len):
+            pos_idx = seq_start + i - 1
+            if pos_idx >= 0 and pos_idx < total_length and i < len(chain_ids):
+                chain_id = chain_ids[i]
+                if chain_id:
+                    color = chain_color_map.get(chain_id, 'rgba(150, 150, 150, 0.5)')
+                    x_pos = pos_idx + 1  # Convert to 1-based
+                    shapes.append(dict(
+                        type="rect", xref=xref, yref=yref,
+                        x0=x_pos - 0.5, y0=chain_y0, x1=x_pos + 0.5, y1=chain_y1,
+                        fillcolor=color, line=dict(width=0)
+                    ))
     
-    # SS rectangles (bottom half: 0.0-0.5)
+    # pLDDT rectangles (middle-top lane) when available
+    if has_plddt_data:
+        for x_pos, val in zip(x_positions, plddt_array):
+            if val <= -5:
+                color = 'rgba(0, 0, 0, 0.0)'
+            elif val < 50:
+                color = 'rgba(255, 125, 69, 0.8)'
+            elif val < 70:
+                color = 'rgba(255, 219, 19, 0.8)'
+            elif val < 90:
+                color = 'rgba(101, 203, 243, 0.8)'
+            else:
+                color = 'rgba(0, 83, 214, 0.8)'
+
+            shapes.append(dict(
+                type="rect", xref=xref, yref=yref,
+                x0=x_pos - 0.5, y0=plddt_y0, x1=x_pos + 0.5, y1=plddt_y1,
+                fillcolor=color, line=dict(width=0)
+            ))
+    
+    # SS rectangles (middle: 0.33-0.6)
     ss_color_lookup = {
-        -1: 'rgba(180, 180, 180, 0.5)', 0: 'rgba(200, 200, 200, 0.5)',
-        1: 'rgba(255, 0, 0, 0.8)', 2: 'rgba(255, 100, 0, 0.8)',
-        3: 'rgba(255, 150, 150, 0.8)', 4: 'rgba(0, 0, 255, 0.8)',
-        5: 'rgba(100, 100, 255, 0.8)', 6: 'rgba(0, 200, 0, 0.8)',
-        7: 'rgba(200, 200, 0, 0.8)'
+        -1: 'rgba(180, 180, 180, 0.5)',  # Gap
+        0: 'rgba(200, 200, 200, 0.5)',   # Coil/no structure (C, -)
+        1: 'rgba(255, 0, 0, 0.8)',       # Alpha helix (H) - Red
+        2: 'rgba(255, 140, 0, 0.8)',     # 3-10 helix (G) - Orange
+        3: 'rgba(255, 150, 150, 0.8)',   # Pi helix (I) - Pink
+        4: 'rgba(0, 0, 255, 0.8)',       # Beta sheet (E) - Blue
+        5: 'rgba(100, 100, 255, 0.8)',   # Beta bridge (B) - Light blue
+        6: 'rgba(0, 200, 0, 0.8)',       # Turn (T) - Green
+        7: 'rgba(200, 200, 0, 0.8)'      # Bend (S) - Yellow
     }
     
     for x_pos, val in zip(x_positions, ss_array):
         color = ss_color_lookup.get(int(val), 'rgba(200, 200, 200, 0.5)')
         shapes.append(dict(
-            type="rect", xref=f"x{row}", yref=f"y{row}",
-            x0=x_pos - 0.5, y0=0.0, x1=x_pos + 0.5, y1=0.5,
+            type="rect", xref=xref, yref=yref,
+            x0=x_pos - 0.5, y0=ss_y0, x1=x_pos + 0.5, y1=ss_y1,
             fillcolor=color, line=dict(width=0)
         ))
     
     # === ANNOTATIONS (amino acids every 10 residues) ===
     annotations = []
     positions = np.arange(seq_start, seq_end + 1)
+    label_stride = 20 if seq_len > 120 else 10
     for i, (pos, aa) in enumerate(zip(positions, sequence)):
-        if i % 10 == 0:
+        if i % label_stride == 0:
             annotations.append(dict(
-                x=pos, y=0.75, xref=f"x{row}", yref=f"y{row}",
+                x=pos, y=aa_y, xref=xref, yref=yref,
                 text=aa, showarrow=False,
                 font=dict(size=7, color='white', family='monospace')
             ))
+
+    # Inline note for structures without pLDDT lane (e.g., non-AlphaFold reference)
+    if not has_plddt_data:
+        annotations.append(dict(
+            x=seq_start,
+            y=1.04,
+            xref=xref,
+            yref=yref,
+            xanchor='left',
+            text='Not an AlphaFold predicted model - No pLDDT data to display',
+            showarrow=False,
+            font=dict(size=10, color='rgba(70,70,70,0.9)')
+        ))
     
-    # === CONSENSUS MARKERS ===
+    # === CONSENSUS MARKERS (bottom third: 0.0-0.33) ===
     if consensus_residues:
         print(f"    🎯 Adding {len(consensus_residues)} consensus markers to row {row}")
         for res_num in consensus_residues:
+            # Single-style consensus marker: small magenta tick at very bottom to minimize gap
             shapes.append(dict(
-                type="line", xref=f"x{row}", yref=f"y{row}",
-                x0=res_num, y0=0.0, x1=res_num, y1=1.0,
-                line=dict(color='rgba(255, 0, 255, 0.4)', width=2)
-            ))
-            annotations.append(dict(
-                x=res_num, y=-0.05, xref=f"x{row}", yref=f"y{row}",
-                text="▼", showarrow=False,
-                font=dict(size=8, color='rgba(255, 0, 255, 0.6)')
+                type="line", xref=xref, yref=yref,
+                x0=res_num, y0=0.1, x1=res_num, y1=0.35,
+                line=dict(color='rgba(214, 51, 132, 0.85)', width=1.8)
             ))
     
     # === HOVER DATA (scatter trace) ===
     hover_text = []
     for i, aa in enumerate(sequence):
         text_parts = [f"AA: {aa}", f"Pos: {int(positions[i])}"]
+        if chain_ids and i < len(chain_ids):
+            text_parts.append(f"Chain: {chain_ids[i]}")
         if plddt_values is not None and i < len(plddt_values):
             text_parts.append(f"pLDDT: {plddt_values[i]:.1f}")
         if ss_codes is not None and i < len(ss_codes):
@@ -723,7 +1060,7 @@ def generate_sequence_track_data(sequence, ss_codes, plddt_values, row, offset=0
     
     trace = go.Scattergl(
         x=positions, y=[0.5] * len(positions),
-        mode='markers', marker=dict(size=0.1, color='rgba(0,0,0,0)'),
+        mode='markers', marker=dict(size=10, color='rgba(0,0,0,0)'),
         showlegend=False, hovertemplate='%{text}<extra></extra>',
         text=hover_text
     )
@@ -738,14 +1075,14 @@ def generate_sequence_track_data(sequence, ss_codes, plddt_values, row, offset=0
     }
 
 
-def add_sequence_track(fig, sequence, ss_codes, plddt_values, row, offset=0, reference_length=0, max_span=0, consensus_residues=None):
+def add_sequence_track(fig, sequence, ss_codes, plddt_values, row, offset=0, reference_length=0, max_span=0, consensus_residues=None, chain_ids=None):
     """
     Add a sequence track to the figure (wrapper for backward compatibility).
     
     This now just calls generate_sequence_track_data and adds results to figure.
     """
     track_data = generate_sequence_track_data(
-        sequence, ss_codes, plddt_values, row, offset,
+        sequence, ss_codes, plddt_values, chain_ids, row, offset,
         reference_length, max_span, consensus_residues
     )
     
