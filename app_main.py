@@ -7,6 +7,7 @@ import webbrowser
 
 import os
 import sys
+import re
 from pathlib import Path
 import warnings
 import tempfile
@@ -558,6 +559,15 @@ app_ui = ui.page_fluid(
                              accept=[".pdb", ".cif"]),
                 ui.tags.small("Upload reference structure for superposition/RMSD calculation", 
                              style="color: #6c757d; display: block; margin-top: 5px; margin-bottom: 10px;"),
+                ui.input_checkbox(
+                    "reference_is_alphafold",
+                    "Reference is AlphaFold (use B-factor as pLDDT in reference lane)",
+                    value=False
+                ),
+                ui.tags.small(
+                    "If unchecked, reference lane hides pLDDT/B-factor to avoid misinterpreting crystal B-factors.",
+                    style="color: #6c757d; display: block; margin-top: -5px; margin-bottom: 10px;"
+                ),
                 style="margin-bottom: 10px;"
             ),
             ui.div(
@@ -570,10 +580,10 @@ app_ui = ui.page_fluid(
             ui.output_ui("upload_status"),
             ui.hr(),
             ui.h5("Analysis Options"),
-            ui.input_text("ligand_chain", "Ligand Chain ID:", 
-                         value="B",
-                         placeholder="e.g., B or C"),
-            ui.tags.small("Chain ID of the ligand/partner molecule (default: B)", 
+            ui.input_text("protein_chains", "Protein Chain ID(s):", 
+                         value="A",
+                         placeholder="e.g., A or A,B"),
+            ui.tags.small("Provide receptor protein chain labels (comma-separated). All other chains are treated as partner/ligand.", 
                          style="color: #6c757d; display: block; margin-top: -5px; margin-bottom: 10px;"),
             ui.input_text("motif_residues", "Motif Residues (optional):", 
                          value="",
@@ -930,6 +940,7 @@ def server(input, output, session):
     cluster_summary = reactive.Value(None)
     rmsd_stats = reactive.Value(None)
     rmsd_matrix = reactive.Value(None)
+    tm_score_stats = reactive.Value(None)
     current_motif = reactive.Value(None)  # Store motif for visualization
     analysis_complete = reactive.Value(False)  # Track if analysis is done
     status_log = reactive.Value([])  # Terminal-style output log
@@ -946,6 +957,76 @@ def server(input, output, session):
         current_log = status_log.get()
         current_log.append(message)
         status_log.set(current_log)
+
+    def parse_protein_chain_labels(chain_text):
+        """Parse comma/space separated chain labels from user input."""
+        if not chain_text:
+            return ['A']
+        labels = [c.strip() for c in re.split(r'[\s,;]+', chain_text.strip()) if c.strip()]
+        return [c.upper() for c in labels] if labels else ['A']
+
+    def build_chain_selections(pdb_file, protein_chain_labels):
+        """
+        Build MDTraj selections using user-provided protein chain labels.
+        Partner/ligand is defined as all non-water atoms NOT in protein chains.
+        """
+        import mdtraj as md
+
+        traj = md.load(pdb_file)
+        topology = traj.topology
+
+        chain_label_to_indices = {}
+        all_chain_labels = []
+        for chain in topology.chains:
+            chain_label = str(chain.chain_id).strip()
+            chain_key = chain_label.upper()
+            chain_label_to_indices.setdefault(chain_key, []).append(chain.index)
+            all_chain_labels.append(chain_label)
+
+        # Resolve requested chain labels to MDTraj chain indices
+        protein_chain_indices = []
+        missing_labels = []
+        for label in protein_chain_labels:
+            key = label.upper()
+            if key in chain_label_to_indices:
+                protein_chain_indices.extend(chain_label_to_indices[key])
+            else:
+                missing_labels.append(label)
+
+        protein_chain_indices = sorted(set(protein_chain_indices))
+
+        # Fallback: if none matched, auto-detect protein chains from topology
+        if len(protein_chain_indices) == 0:
+            auto_protein_indices = []
+            auto_protein_labels = []
+            for chain in topology.chains:
+                residues = list(chain.residues)
+                if any(getattr(res, 'is_protein', False) for res in residues):
+                    auto_protein_indices.append(chain.index)
+                    auto_protein_labels.append(str(chain.chain_id).strip())
+
+            if auto_protein_indices:
+                protein_chain_indices = sorted(set(auto_protein_indices))
+                protein_chain_labels = sorted(set([lbl.upper() for lbl in auto_protein_labels]))
+
+        if len(protein_chain_indices) == 0:
+            raise ValueError(
+                f"Could not resolve protein chains from input {protein_chain_labels}. "
+                f"Available chains: {sorted(set(all_chain_labels))}"
+            )
+
+        chain_clause = ' or '.join([f"chainid == {idx}" for idx in protein_chain_indices])
+        protein_selection = f"protein and ({chain_clause})"
+        partner_selection = f"not water and not ({chain_clause})"
+
+        return {
+            'protein_selection': protein_selection,
+            'partner_selection': partner_selection,
+            'protein_chain_indices': protein_chain_indices,
+            'missing_labels': missing_labels,
+            'available_labels': sorted(set(all_chain_labels)),
+            'resolved_labels': protein_chain_labels
+        }
     
     @output
     @render.ui
@@ -1149,6 +1230,10 @@ def server(input, output, session):
             if rmsd_stats.get() is not None:
                 csv_buffer = rmsd_stats.get().to_csv(index=False)
                 zipf.writestr("cluster_rmsd_summary.csv", csv_buffer)
+
+            if tm_score_stats.get() is not None:
+                csv_buffer = tm_score_stats.get().to_csv(index=False)
+                zipf.writestr("tm_score_vs_reference.csv", csv_buffer)
             
             # Add plots as HTML
             try:
@@ -1201,7 +1286,7 @@ def server(input, output, session):
                         pdb_files=clust.pdb_files
                     )
                     zipf.writestr("rmsd_heatmap.html", fig.to_html())
-                    
+
             except Exception as e:
                 print(f"Error generating plots for ZIP: {e}")
         
@@ -1367,11 +1452,11 @@ def server(input, output, session):
                 try:
                     # Check if it's a PDB/CIF or FASTA file
                     if ref_seq_file.lower().endswith(('.pdb', '.cif')):
-                        # Get ligand chain if available (default to 'B')
-                        lig_ch = input.ligand_chain().strip() or 'B'
-                        ref_sequence = extract_sequence_from_pdb(ref_seq_file, ligand_chain=lig_ch)
+                        # Extract sequence from user-provided protein chains
+                        prot_chains = parse_protein_chain_labels(input.protein_chains())
+                        ref_sequence = extract_sequence_from_pdb(ref_seq_file, chain_id=prot_chains)
                         log_status(f"✓ Reference sequence extracted from structure: {len(ref_sequence)} residues")
-                        print(f"  Extracted from structure (excluding chain {lig_ch}): {len(ref_sequence)} residues")
+                        print(f"  Extracted from structure (protein chains {prot_chains}): {len(ref_sequence)} residues")
                         print(f"  First 50 chars: {ref_sequence[:50]}")
                         # Store structure path for visualization
                         clust.reference_pdb = ref_seq_file
@@ -1403,10 +1488,10 @@ def server(input, output, session):
                 # Also extract sequence from model if not already done
                 if clust.reference_sequence is None:
                     try:
-                        lig_ch = input.ligand_chain().strip() or 'B'
-                        ref_sequence = extract_sequence_from_pdb(ref_model_file, ligand_chain=lig_ch)
+                        prot_chains = parse_protein_chain_labels(input.protein_chains())
+                        ref_sequence = extract_sequence_from_pdb(ref_model_file, chain_id=prot_chains)
                         clust.reference_sequence = ref_sequence
-                        print(f"  Extracted sequence from reference model (excluding chain {lig_ch}): {len(ref_sequence)} residues")
+                        print(f"  Extracted sequence from reference model (protein chains {prot_chains}): {len(ref_sequence)} residues")
                     except Exception as e:
                         print(f"  Could not extract sequence from reference model: {e}")
             
@@ -1420,12 +1505,25 @@ def server(input, output, session):
             motif_input = input.motif_residues().strip()
             motif_dict = InterfaceAnalyzer.parse_motif_residues(motif_input) if motif_input else None
             
-            # Get ligand chain ID
-            ligand_chain = input.ligand_chain().strip() or "B"
-            log_status(f"Ligand chain: {ligand_chain}")
-            
-            # Store ligand chain in clusterer for later use
-            clust.ligand_chain = ligand_chain
+            # Get receptor protein chains from input
+            protein_chains = parse_protein_chain_labels(input.protein_chains())
+            log_status(f"Protein chain(s): {', '.join(protein_chains)}")
+
+            # Build chain-aware selections from first structure
+            chain_selection_info = build_chain_selections(pdb_files[0], protein_chains)
+            protein_selection = chain_selection_info['protein_selection']
+            ligand_selection = chain_selection_info['partner_selection']
+
+            if chain_selection_info['missing_labels']:
+                log_status(
+                    f"  ⚠️ Chain label(s) not found: {', '.join(chain_selection_info['missing_labels'])} "
+                    f"(available: {', '.join(chain_selection_info['available_labels'])})"
+                )
+            log_status(f"  Resolved protein chain indices: {chain_selection_info['protein_chain_indices']}")
+
+            # Store protein chain config in clusterer for downstream views
+            clust.protein_chains = protein_chains
+            clust.protein_chain_indices = chain_selection_info['protein_chain_indices']
             
             # STEP 1: Compute Jaccard matrix (chain-aware!)
             log_status("STEP 1: Computing Jaccard contact matrix...")
@@ -1437,14 +1535,8 @@ def server(input, output, session):
             else:
                 log_status(f"  🌍 GLOBAL MODE: All interface contacts")
             
-            # Use chain-specific selections for AlphaFold2 models
-            # MDTraj uses chainid == X syntax (0-indexed or letter-based)
-            # Target protein is all protein atoms NOT in ligand chain, ligand is the specified chain
-            protein_selection = f"protein and not (chainid == {ord(ligand_chain) - ord('A')})"
-            ligand_selection = f"chainid == {ord(ligand_chain) - ord('A')}"
-            
             log_status(f"  Target (protein) selection: {protein_selection}")
-            log_status(f"  Ligand selection: {ligand_selection}")
+            log_status(f"  Partner selection (NOT protein chains): {ligand_selection}")
             
             # Get residue offset toggle
             apply_offset = input.apply_residue_offset()
@@ -1463,6 +1555,32 @@ def server(input, output, session):
             log_status("✓ Jaccard matrix computed")
             ui.notification_show("✓ Contact matrix done", type="message", duration=2)
             log_status("")
+
+            # STEP 1.5: TM-score QC against provided reference structure (optional)
+            tm_score_stats.set(None)
+            if clust.reference_pdb and os.path.exists(clust.reference_pdb):
+                log_status("STEP 1.5: Computing TM-score vs reference...")
+                try:
+                    tm_df = compute_tm_scores_to_reference(
+                        reference_pdb=clust.reference_pdb,
+                        pdb_files=clust.pdb_files,
+                        protein_chains=protein_chains
+                    )
+                    if tm_df is not None and len(tm_df) > 0:
+                        tm_score_stats.set(tm_df)
+                        valid_tm = tm_df['tm_score'].dropna()
+                        if len(valid_tm) > 0:
+                            log_status(
+                                f"✓ TM-score computed (mean={valid_tm.mean():.3f}, "
+                                f"min={valid_tm.min():.3f}, max={valid_tm.max():.3f})"
+                            )
+                        else:
+                            log_status("⚠️ TM-score produced no valid alignments")
+                    else:
+                        log_status("⚠️ TM-score skipped (no valid data)")
+                except Exception as e:
+                    log_status(f"⚠️ TM-score computation failed: {str(e)}")
+                log_status("")
             
             # STEP 2: Compute RMSD matrix
             log_status("STEP 2: Computing RMSD matrix...")
@@ -1556,6 +1674,13 @@ def server(input, output, session):
                 if len(match_scores) > 0 and len(match_scores) == len(stats_df):
                     stats_df['motif_match_pct'] = match_scores
                     log_status("✓ Motif match scores added to interface stats")
+
+            # Add TM-score per structure if available
+            tm_df = tm_score_stats.get()
+            if tm_df is not None and len(tm_df) > 0:
+                tm_map = dict(zip(tm_df['structure'], tm_df['tm_score']))
+                stats_df['tm_score'] = stats_df['structure'].map(tm_map)
+                log_status("✓ TM-score added to interface stats")
             
             interface_stats.set(stats_df)
             
@@ -1595,6 +1720,16 @@ def server(input, output, session):
                         log_status("✓ Motif match scores added to cluster summary")
                 except Exception as e:
                     log_status(f"⚠️ Could not compute motif match scores: {str(e)}")
+
+            # Add average TM-score per cluster (from per-structure stats)
+            if 'tm_score' in stats_df.columns:
+                cluster_tm = (
+                    stats_df.groupby('cluster', as_index=False)['tm_score']
+                    .mean()
+                    .rename(columns={'tm_score': 'avg_tm_score'})
+                )
+                summary_with_rmsd = summary_with_rmsd.merge(cluster_tm, on='cluster', how='left')
+                log_status("✓ Avg TM-score added to cluster summary")
             
             # Add cluster stability scores if HDBSCAN clustering was used
             if hasattr(clust, 'hdbscan_clusterer') and clust.hdbscan_clusterer is not None:
@@ -1781,6 +1916,12 @@ def server(input, output, session):
             
             # Recompute interface stats (fast - just regrouping)
             stats_df = clust.get_interface_stats()
+
+            # Re-attach TM-score per structure if available
+            tm_df = tm_score_stats.get()
+            if tm_df is not None and len(tm_df) > 0:
+                tm_map = dict(zip(tm_df['structure'], tm_df['tm_score']))
+                stats_df['tm_score'] = stats_df['structure'].map(tm_map)
             
             # Mark representatives
             if rmsd_qc is not None:
@@ -1810,6 +1951,15 @@ def server(input, output, session):
             # Add RMSD stats
             summary_with_rmsd = summary.merge(rmsd_qc[['cluster', 'mean_rmsd', 'std_rmsd', 'medoid_idx']], 
                                                on='cluster', how='left')
+
+            # Add average TM-score per cluster
+            if 'tm_score' in stats_df.columns:
+                cluster_tm = (
+                    stats_df.groupby('cluster', as_index=False)['tm_score']
+                    .mean()
+                    .rename(columns={'tm_score': 'avg_tm_score'})
+                )
+                summary_with_rmsd = summary_with_rmsd.merge(cluster_tm, on='cluster', how='left')
             
             cluster_summary.set(summary_with_rmsd)
             
@@ -2129,6 +2279,7 @@ def server(input, output, session):
         # Show key columns including intra-cluster RMSD metrics, stability, motif match, and medoid info
         display_cols = ['cluster', 'binding_mode', 'n_structures', 'stability_score', 'avg_motif_match', 'n_consensus', 
                        'mean_rmsd', 'std_rmsd', 'median_rmsd', 'max_rmsd', 'min_rmsd',
+                       'avg_tm_score',
                        'mean_rmsd_sequential', 'medoid_avg_rmsd', 'medoid_structure']
         
         # Only show columns that actually exist
@@ -2168,6 +2319,8 @@ def server(input, output, session):
             rename_map['mean_rmsd_sequential'] = 'Sequential RMSD (Å)'
         if 'medoid_avg_rmsd' in display_df.columns:
             rename_map['medoid_avg_rmsd'] = 'Medoid Avg RMSD (Å)'
+        if 'avg_tm_score' in display_df.columns:
+            rename_map['avg_tm_score'] = 'Avg TM-score (vs Ref)'
         
         if rename_map:
             display_df = display_df.rename(columns=rename_map)
@@ -2176,7 +2329,8 @@ def server(input, output, session):
         numeric_cols = ['Avg Motif Match (%)', 'Stability Score',
                        'Intra-Cluster Mean RMSD (Å)', 'Intra-Cluster Std RMSD (Å)', 
                        'Median RMSD (Å)', 'Max RMSD (Å)', 'Min RMSD (Å)',
-                       'Sequential RMSD (Å)', 'Medoid Avg RMSD (Å)']
+                       'Sequential RMSD (Å)', 'Medoid Avg RMSD (Å)',
+                       'Avg TM-score (vs Ref)']
         
         for col in numeric_cols:
             if col in display_df.columns:
@@ -2483,7 +2637,7 @@ def server(input, output, session):
         except Exception as e:
             import traceback
             return ui.HTML(f"<pre style='color: red;'>Error: {e}\n{traceback.format_exc()}</pre>")
-    
+
     # ========== INTERACTIVE MAPS TAB ==========
     
     @output
@@ -2693,7 +2847,8 @@ def server(input, output, session):
                     reference_pdb=ref_pdb,
                     reference_sequence=ref_seq,
                     cluster_summary=summary_df,
-                    ligand_chain=clust.ligand_chain if hasattr(clust, 'ligand_chain') else 'B'
+                    protein_chains=clust.protein_chains if hasattr(clust, 'protein_chains') else ['A'],
+                    reference_is_alphafold=input.reference_is_alphafold()
                 )
             else:
                 # Within cluster mode
@@ -2707,7 +2862,7 @@ def server(input, output, session):
                     clust.pdb_files,
                     clust.labels,
                     cluster_id,
-                    ligand_chain=clust.ligand_chain if hasattr(clust, 'ligand_chain') else 'B'
+                    protein_chains=clust.protein_chains if hasattr(clust, 'protein_chains') else ['A']
                 )
             
             # Convert to HTML with explicit config
@@ -2865,6 +3020,11 @@ def server(input, output, session):
         
         # Start with basic columns (contacts will be added at the end)
         cols = ['structure', 'cluster', 'n_protein_residues', 'n_nucleic_residues', 'representative']
+
+        # Add per-structure TM-score vs reference (if available)
+        if 'tm_score' in display_df.columns:
+            display_df['TM-score (vs Ref)'] = display_df['tm_score'].apply(lambda x: f"{x:.4g}" if pd.notna(x) else "")
+            cols.append('TM-score (vs Ref)')
         
         # Add motif match % BEFORE ΔSASA columns (as requested)
         if 'motif_match_pct' in display_df.columns:
@@ -2953,11 +3113,21 @@ def server(input, output, session):
             if stats_df is not None:
                 struct_info = stats_df[stats_df['structure'] == structure_name].iloc[0]
                 
+                # Get TM-score if available
+                tm_score_display = ""
+                if 'tm_score' in struct_info and pd.notna(struct_info['tm_score']):
+                    tm_score_val = struct_info['tm_score']
+                    tm_score_display = f"<span style='float: right; font-weight: bold; color: #0d6efd;'>TM-score: {tm_score_val:.4g}</span>"
+                
+                # Get contact residues list (full, no truncation)
+                contact_residues = struct_info.get('protein_residues', '')
+                contact_residues_html = f"<div style='word-break: break-word; white-space: normal;'><small>Interface: {contact_residues}</small></div>" if contact_residues else "<small>Interface: N/A</small>"
+                
                 info_html = f"""
                 <div style="padding: 10px; background-color: #f8f9fa; margin-bottom: 10px; border-radius: 5px; border-left: 4px solid #0d6efd;">
-                    <b>{structure_name}</b> - <span style="color: #0d6efd;">Cluster {struct_info['cluster']}</span><br>
+                    <b>{structure_name}</b> - <span style="color: #0d6efd;">Cluster {struct_info['cluster']}</span>{tm_score_display}<br style="clear: both;">
                     <small>Protein residues: {struct_info['n_protein_residues']} | DNA/RNA residues: {struct_info['n_nucleic_residues']}</small><br>
-                    <small>Interface: {struct_info.get('protein_residues', '')[:80]}...</small>
+                    {contact_residues_html}
                 </div>
                 """
                 return ui.HTML(info_html)
@@ -3014,6 +3184,150 @@ def server(input, output, session):
 
 
 # Helper function: Compute RMSD QC stats
+def compute_tm_scores_to_reference(reference_pdb, pdb_files, protein_chains=None):
+    """
+    Compute TM-score for each model against a provided reference structure.
+
+    Notes
+    -----
+    - Uses CA atoms from selected protein chains.
+    - Matches residues by (chain_instance, resSeq) across reference and target.
+    - Returns NaN for structures without enough matched CA atoms.
+    """
+    import mdtraj as md
+
+    def _get_chain_instance_map(topology):
+        counts = {}
+        chain_instance = {}
+        for chain in topology.chains:
+            label = str(chain.chain_id).strip().upper()
+            counts[label] = counts.get(label, 0) + 1
+            chain_instance[chain.index] = f"{label}#{counts[label]}"
+        return chain_instance
+
+    def _resolve_chain_indices(topology, chain_labels):
+        if not chain_labels:
+            # Auto-select all protein chains
+            protein_indices = []
+            for chain in topology.chains:
+                residues = list(chain.residues)
+                if any(getattr(res, 'is_protein', False) for res in residues):
+                    protein_indices.append(chain.index)
+            return sorted(set(protein_indices))
+
+        requested = {c.strip().upper() for c in chain_labels if c and c.strip()}
+        resolved = []
+        for chain in topology.chains:
+            label = str(chain.chain_id).strip().upper()
+            if label in requested:
+                resolved.append(chain.index)
+        return sorted(set(resolved))
+
+    def _extract_ca_map(traj, chain_indices):
+        top = traj.topology
+        chain_instance = _get_chain_instance_map(top)
+        ca_map = {}
+        for atom in top.atoms:
+            if atom.name != 'CA':
+                continue
+            res = atom.residue
+            if not getattr(res, 'is_protein', False):
+                continue
+            if res.chain.index not in chain_indices:
+                continue
+            key = (chain_instance[res.chain.index], int(res.resSeq))
+            if key not in ca_map:
+                ca_map[key] = atom.index
+        return ca_map
+
+    def _kabsch_align(mobile_xyz, target_xyz):
+        mobile_center = mobile_xyz.mean(axis=0)
+        target_center = target_xyz.mean(axis=0)
+
+        mobile_centered = mobile_xyz - mobile_center
+        target_centered = target_xyz - target_center
+
+        cov = mobile_centered.T @ target_centered
+        u, _, vt = np.linalg.svd(cov)
+        rot = vt.T @ u.T
+
+        # Ensure right-handed rotation
+        if np.linalg.det(rot) < 0:
+            vt[-1, :] *= -1
+            rot = vt.T @ u.T
+
+        return (mobile_centered @ rot) + target_center
+
+    def _tm_score_from_distances(distances, length_norm):
+        if length_norm <= 0:
+            return np.nan
+        if length_norm <= 21:
+            d0 = 0.5
+        else:
+            d0 = 1.24 * ((length_norm - 15) ** (1.0 / 3.0)) - 1.8
+            d0 = max(d0, 0.5)
+        return float(np.mean(1.0 / (1.0 + (distances / d0) ** 2)))
+
+    # Load reference
+    ref_traj = md.load(reference_pdb)
+    ref_chain_indices = _resolve_chain_indices(ref_traj.topology, protein_chains)
+    if len(ref_chain_indices) == 0:
+        raise ValueError(f"No matching protein chains found in reference for {protein_chains}")
+
+    ref_ca_map = _extract_ca_map(ref_traj, ref_chain_indices)
+    ref_ca_count = len(ref_ca_map)
+    if ref_ca_count == 0:
+        raise ValueError("No reference CA atoms found for selected protein chains")
+
+    results = []
+    for pdb_file in pdb_files:
+        structure_name = os.path.basename(pdb_file)
+        try:
+            model_traj = md.load(pdb_file)
+            model_chain_indices = _resolve_chain_indices(model_traj.topology, protein_chains)
+            model_ca_map = _extract_ca_map(model_traj, model_chain_indices)
+
+            common_keys = sorted(set(ref_ca_map.keys()) & set(model_ca_map.keys()))
+            n_aligned = len(common_keys)
+            coverage = (n_aligned / ref_ca_count) if ref_ca_count > 0 else np.nan
+
+            if n_aligned < 3:
+                results.append({
+                    'structure': structure_name,
+                    'tm_score': np.nan,
+                    'n_aligned_ca': n_aligned,
+                    'ca_coverage': coverage
+                })
+                continue
+
+            ref_idx = np.array([ref_ca_map[k] for k in common_keys], dtype=int)
+            model_idx = np.array([model_ca_map[k] for k in common_keys], dtype=int)
+
+            ref_xyz = ref_traj.xyz[0, ref_idx, :]
+            model_xyz = model_traj.xyz[0, model_idx, :]
+
+            aligned_model_xyz = _kabsch_align(model_xyz, ref_xyz)
+            distances_angstrom = np.linalg.norm(aligned_model_xyz - ref_xyz, axis=1) * 10.0
+
+            tm_score = _tm_score_from_distances(distances_angstrom, length_norm=len(ref_xyz))
+            results.append({
+                'structure': structure_name,
+                'tm_score': tm_score,
+                'n_aligned_ca': n_aligned,
+                'ca_coverage': coverage
+            })
+
+        except Exception:
+            results.append({
+                'structure': structure_name,
+                'tm_score': np.nan,
+                'n_aligned_ca': 0,
+                'ca_coverage': 0.0
+            })
+
+    return pd.DataFrame(results)
+
+
 def compute_rmsd_qc(labels, rmsd_matrix):
     """
     Compute inter-cluster RMSD statistics for QC

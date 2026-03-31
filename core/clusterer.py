@@ -33,23 +33,33 @@ def load_universe_with_cif_support(pdb_file):
     if file_ext.endswith('.cif'):
         # AlphaFold 3 CIF files - convert to PDB using BioPython
         from Bio.PDB import MMCIFParser, PDBIO
+        import atexit
         
         parser = MMCIFParser(QUIET=True)
         structure = parser.get_structure('structure', pdb_file)
         
-        # Write to temporary PDB file
+        # Write to temporary PDB file - keep it persistent for MDAnalysis DSSP
+        # Use delete=True so system cleans it up, but don't unlink immediately
         temp_pdb = tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False)
+        temp_file_path = temp_pdb.name
         temp_pdb.close()
         
         io = PDBIO()
         io.set_structure(structure)
-        io.save(temp_pdb.name)
+        io.save(temp_file_path)
         
         # Load the converted PDB
-        u = mda.Universe(temp_pdb.name)
+        u = mda.Universe(temp_file_path)
         
-        # Clean up temp file
-        os.unlink(temp_pdb.name)
+        # Register cleanup to happen at program exit (not immediately)
+        # This allows MDAnalysis DSSP to reopen the file when needed
+        def cleanup_temp():
+            try:
+                if os.path.exists(temp_file_path):
+                    os.unlink(temp_file_path)
+            except:
+                pass
+        atexit.register(cleanup_temp)
         
         return u
     else:
