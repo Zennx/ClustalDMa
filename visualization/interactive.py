@@ -2131,7 +2131,7 @@ def create_contact_residue_heatmap(contact_residue_pairs, labels, pdb_files, clu
         reversescale=False,
         colorbar=dict(title="Contact<br>Distance (Å)"),
         zmin=0,
-        zmax=6  # Typical contact cutoff
+        zmax=4.5  # Typical contact cutoff
     ))
     
     # Update layout with tight margins
