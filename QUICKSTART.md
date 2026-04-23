@@ -31,6 +31,10 @@ shiny run app_main.py
 4. **Adjust clustering parameters**
    - `min_cluster_size`: Minimum structures per cluster (default: 5)
    - `min_samples`: Controls noise sensitivity (default: 2)
+   - `Cluster Selection Epsilon`: Merge nearby clusters after selection (default: 0.0)
+   - `Cluster Selection Method`:
+     - `eom` / `leaf` = cluster directly on precomputed distance matrix
+     - `mds` / `tsne` / `umap` / `pca` = cluster on 2D embedding (uses EOM internally)
    - `Filter Near-Duplicates`: Remove very similar structures
 
 5. **Run Analysis**
@@ -52,6 +56,9 @@ shiny run app_main.py
 ## Tips
 
 - For large datasets (100+ models), enable "Filter Near-Duplicates"
+- Start with `eom` and `epsilon=0.0`, then increase epsilon slightly (e.g., 0.01-0.05) if clusters are over-split
+- Try `mds` or `umap` selection method when precomputed-matrix clustering is too conservative
 - Use motif residues if you want to focus on specific binding sites
 - Check the HDBSCAN condensed tree to evaluate cluster stability
+- Re-Cluster now refreshes statistics and images (not only labels), so you can tune parameters iteratively
 - Export cluster PDBs for further analysis in external tools

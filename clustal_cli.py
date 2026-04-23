@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 import json
+import re
 
 # Import core modules
 from core.clusterer import PDBClusterer
@@ -36,7 +37,7 @@ Examples:
   
   # Full parameter specification
   python clustal_cli.py -m models/ -r reference.pdb -o results/ \\
-      --ligand-id L --apply-offset --min-cluster-size 5 --min-samples 2 \\
+      --protein-chains A --apply-offset --min-cluster-size 5 --min-samples 2 \\
       --filter-duplicates --distance-cutoff 4.5
         """
     )
@@ -62,9 +63,16 @@ Examples:
     )
     
     parser.add_argument(
+        '--protein-chains',
+        default='A',
+        help='Protein chain ID(s), comma/space separated (default: A)'
+    )
+
+    # Backward compatibility with older CLI usage.
+    parser.add_argument(
         '--ligand-id',
-        default='B',
-        help='Ligand chain ID (default: B for second chain)'
+        default=None,
+        help=argparse.SUPPRESS
     )
     
     parser.add_argument(
@@ -85,6 +93,20 @@ Examples:
         type=int,
         default=2,
         help='HDBSCAN minimum samples (default: 2)'
+    )
+
+    parser.add_argument(
+        '--hdbscan-epsilon',
+        type=float,
+        default=0.0,
+        help='HDBSCAN cluster_selection_epsilon (default: 0.0)'
+    )
+
+    parser.add_argument(
+        '--hdbscan-selection-method',
+        default='eom',
+        choices=['eom', 'leaf', 'mds', 'tsne', 'umap', 'pca'],
+        help='HDBSCAN strategy: eom/leaf on precomputed matrix, or mds/tsne/umap/pca (2D embedding + EOM)'
     )
     
     parser.add_argument(
@@ -108,6 +130,76 @@ Examples:
     )
     
     return parser.parse_args()
+
+
+def parse_protein_chain_labels(chain_text):
+    """Parse comma/space separated chain labels from CLI input."""
+    if not chain_text:
+        return ['A']
+    labels = [c.strip() for c in re.split(r'[\s,;]+', chain_text.strip()) if c.strip()]
+    return [c.upper() for c in labels] if labels else ['A']
+
+
+def build_chain_selections(pdb_file, protein_chain_labels):
+    """
+    Build MDTraj selections from protein chain labels.
+    Partner/ligand is all non-water atoms NOT in protein chains.
+    """
+    import mdtraj as md
+
+    traj = md.load(pdb_file)
+    topology = traj.topology
+
+    chain_label_to_indices = {}
+    all_chain_labels = []
+    for chain in topology.chains:
+        chain_label = str(chain.chain_id).strip()
+        chain_key = chain_label.upper()
+        chain_label_to_indices.setdefault(chain_key, []).append(chain.index)
+        all_chain_labels.append(chain_label)
+
+    protein_chain_indices = []
+    missing_labels = []
+    for label in protein_chain_labels:
+        key = label.upper()
+        if key in chain_label_to_indices:
+            protein_chain_indices.extend(chain_label_to_indices[key])
+        else:
+            missing_labels.append(label)
+
+    protein_chain_indices = sorted(set(protein_chain_indices))
+
+    if len(protein_chain_indices) == 0:
+        auto_protein_indices = []
+        auto_protein_labels = []
+        for chain in topology.chains:
+            residues = list(chain.residues)
+            if any(getattr(res, 'is_protein', False) for res in residues):
+                auto_protein_indices.append(chain.index)
+                auto_protein_labels.append(str(chain.chain_id).strip())
+
+        if auto_protein_indices:
+            protein_chain_indices = sorted(set(auto_protein_indices))
+            protein_chain_labels = sorted(set([lbl.upper() for lbl in auto_protein_labels]))
+
+    if len(protein_chain_indices) == 0:
+        raise ValueError(
+            f"Could not resolve protein chains from input {protein_chain_labels}. "
+            f"Available chains: {sorted(set(all_chain_labels))}"
+        )
+
+    chain_clause = ' or '.join([f"chainid == {idx}" for idx in protein_chain_indices])
+    protein_selection = f"protein and ({chain_clause})"
+    partner_selection = f"not water and not ({chain_clause})"
+
+    return {
+        'protein_selection': protein_selection,
+        'partner_selection': partner_selection,
+        'protein_chain_indices': protein_chain_indices,
+        'missing_labels': missing_labels,
+        'available_labels': sorted(set(all_chain_labels)),
+        'resolved_labels': protein_chain_labels
+    }
 
 
 def setup_output_directory(output_dir):
@@ -398,8 +490,8 @@ def generate_summary_html(output_dirs, params, cluster_summary, analysis_time):
                 <div class="param-value">{params['n_structures']}</div>
             </div>
             <div class="param-item">
-                <div class="param-label">Ligand Chain ID</div>
-                <div class="param-value">{params['ligand_id']}</div>
+                <div class="param-label">Protein Chain(s)</div>
+                <div class="param-value">{params['protein_chains']}</div>
             </div>
             <div class="param-item">
                 <div class="param-label">Distance Cutoff</div>
@@ -412,6 +504,14 @@ def generate_summary_html(output_dirs, params, cluster_summary, analysis_time):
             <div class="param-item">
                 <div class="param-label">Min Samples</div>
                 <div class="param-value">{params['min_samples']}</div>
+            </div>
+            <div class="param-item">
+                <div class="param-label">HDBSCAN Epsilon</div>
+                <div class="param-value">{params['hdbscan_epsilon']}</div>
+            </div>
+            <div class="param-item">
+                <div class="param-label">HDBSCAN Method</div>
+                <div class="param-value">{params['hdbscan_selection_method']}</div>
             </div>
             <div class="param-item">
                 <div class="param-label">Apply Residue Offset</div>
@@ -600,24 +700,53 @@ def main():
     
     # Run analysis
     print(f"\n🚀 Starting analysis pipeline...")
-    print(f"   HDBSCAN parameters: min_cluster_size={args.min_cluster_size}, min_samples={args.min_samples}")
+    print(
+        "   HDBSCAN parameters: "
+        f"min_cluster_size={args.min_cluster_size}, "
+        f"min_samples={args.min_samples}, "
+        f"epsilon={args.hdbscan_epsilon}, "
+        f"method={args.hdbscan_selection_method}"
+    )
+    print(f"   Protein chains: {args.protein_chains}")
     print(f"   This may take several minutes for large datasets...")
     
     import time
     start_time = time.time()
+    protein_chain_report_value = args.protein_chains
     
     try:
-        # Use chain-based selections (like Shiny app) for AlphaFold multimers
-        # MDTraj uses 0-indexed chainid, so A=0, B=1, etc.
-        ligand_chain_idx = ord(args.ligand_id) - ord('A')
-        
-        # Receptor: all protein atoms NOT in ligand chain
-        protein_selection = f"protein and not (chainid == {ligand_chain_idx})"
-        # Ligand: just the specified chain (works for both protein and nucleic)
-        ligand_selection = f"chainid == {ligand_chain_idx}"
-        
-        print(f"   Receptor (chain not {args.ligand_id}): '{protein_selection}'")
-        print(f"   Ligand (chain {args.ligand_id}): '{ligand_selection}'")
+        protein_chains = parse_protein_chain_labels(args.protein_chains)
+
+        # Backward-compatible fallback path for older --ligand-id usage.
+        if args.ligand_id:
+            ligand_id = str(args.ligand_id).strip().upper()
+            if len(ligand_id) != 1 or not ligand_id.isalpha():
+                raise ValueError("--ligand-id must be a single alphabetic chain label (deprecated option)")
+
+            print("   ⚠️  --ligand-id is deprecated; prefer --protein-chains")
+            ligand_chain_idx = ord(ligand_id) - ord('A')
+            protein_selection = f"protein and not (chainid == {ligand_chain_idx})"
+            ligand_selection = f"chainid == {ligand_chain_idx}"
+            protein_chain_report_value = f"NOT {ligand_id} (deprecated --ligand-id mode)"
+            print(f"   Receptor (chain not {ligand_id}): '{protein_selection}'")
+            print(f"   Partner (chain {ligand_id}): '{ligand_selection}'")
+        else:
+            chain_selection_info = build_chain_selections(str(pdb_files[0]), protein_chains)
+            protein_selection = chain_selection_info['protein_selection']
+            ligand_selection = chain_selection_info['partner_selection']
+            protein_chain_report_value = ", ".join(protein_chains)
+
+            if chain_selection_info['missing_labels']:
+                print(
+                    "   ⚠️  Chain label(s) not found: "
+                    f"{', '.join(chain_selection_info['missing_labels'])} "
+                    f"(available: {', '.join(chain_selection_info['available_labels'])})"
+                )
+
+            print(f"   Protein chains: {', '.join(protein_chains)}")
+            print(f"   Resolved protein chain indices: {chain_selection_info['protein_chain_indices']}")
+            print(f"   Target (protein) selection: '{protein_selection}'")
+            print(f"   Partner selection (NOT protein chains): '{ligand_selection}'")
         
         # Compute Jaccard contact matrix
         clusterer.compute_jaccard_contact_matrix(
@@ -632,7 +761,9 @@ def main():
         clusterer.cluster_hdbscan(
             min_cluster_size=args.min_cluster_size,
             min_samples=args.min_samples,
-            filter_duplicates=args.filter_duplicates
+            filter_duplicates=args.filter_duplicates,
+            cluster_selection_epsilon=args.hdbscan_epsilon,
+            cluster_selection_method=args.hdbscan_selection_method
         )
         
         analysis_time = time.time() - start_time
@@ -1108,10 +1239,12 @@ def main():
         {
             'models': args.models,
             'n_structures': len(pdb_files),
-            'ligand_id': args.ligand_id,
+            'protein_chains': protein_chain_report_value,
             'distance_cutoff': args.distance_cutoff,
             'min_cluster_size': args.min_cluster_size,
             'min_samples': args.min_samples,
+            'hdbscan_epsilon': args.hdbscan_epsilon,
+            'hdbscan_selection_method': args.hdbscan_selection_method,
             'apply_offset': args.apply_offset,
             'filter_duplicates': args.filter_duplicates
         },

@@ -48,7 +48,9 @@ python clustal_cli.py \
   -m models/ \
   -r reference.pdb \
   -o results/ \
-  --ligand-id L \
+  --protein-chains A \
+  --hdbscan-selection-method mds \
+  --hdbscan-epsilon 0.02 \
   --min-cluster-size 5 \
   --filter-duplicates
 
@@ -100,6 +102,7 @@ open results/index.html
 ## Features
 
 - **HDBSCAN clustering** based on protein-nucleic acid contact similarity
+- **Flexible HDBSCAN strategy**: `eom`/`leaf` on precomputed matrix or 2D embedding modes (`mds`, `tsne`, `umap`, `pca`)
 - **Interactive 3D visualizations** (t-SNE, UMAP, dendrograms)
 - **Sequence alignment QC** with secondary structure and pLDDT confidence
 - **Consensus contact identification** per cluster

@@ -42,10 +42,12 @@ python clustal_cli.py \
   -m models/ \
   -r reference.pdb \
   -o results/ \
-  --ligand-id L \
+  --protein-chains A \
   --apply-offset \
   --min-cluster-size 10 \
   --min-samples 2 \
+  --hdbscan-epsilon 0.05 \
+  --hdbscan-selection-method mds \
   --filter-duplicates \
   --distance-cutoff 4.5 \
   --n-jobs -1
@@ -86,13 +88,31 @@ All 6 models will be found and analyzed!
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `-r, --reference` | None | Reference PDB file for sequence alignment |
-| `--ligand-id` | `L` | Chain ID for DNA/RNA ligand |
+| `--protein-chains` | `A` | Protein chain ID(s), comma/space separated (GUI-aligned semantics) |
 | `--apply-offset` | False | Apply residue number corrections for chopped models |
 | `--min-cluster-size` | 5 | HDBSCAN minimum cluster size |
 | `--min-samples` | 2 | HDBSCAN minimum samples parameter |
+| `--hdbscan-epsilon` | 0.0 | HDBSCAN `cluster_selection_epsilon` (post-selection cluster merging) |
+| `--hdbscan-selection-method` | `eom` | One of: `eom`, `leaf`, `mds`, `tsne`, `umap`, `pca` |
 | `--filter-duplicates` | False | Filter near-duplicate structures (RMSD < 0.5 Å) |
 | `--distance-cutoff` | 4.5 | Contact distance cutoff in Ångströms |
 | `--n-jobs` | -1 | Number of parallel jobs (-1 = all CPUs) |
+
+**Compatibility note:** `--ligand-id` is still accepted as a deprecated fallback, but new workflows should use `--protein-chains`.
+
+### HDBSCAN Selection Modes
+
+- `eom` / `leaf`: cluster directly on the precomputed distance matrix
+- `mds` / `tsne` / `umap` / `pca`: first project distances into 2D, then cluster those coordinates with HDBSCAN `eom`
+
+Example:
+```bash
+python clustal_cli.py \
+  -m models/ \
+  -o results_mds/ \
+  --hdbscan-selection-method mds \
+  --hdbscan-epsilon 0.02
+```
 
 ---
 
@@ -175,13 +195,13 @@ The `--apply-offset` flag automatically detects and corrects residue numbering f
 
 ---
 
-### Example 4: Different Ligand Chain
+### Example 4: Specify Protein Chains (GUI-Aligned)
 ```bash
-# If DNA/RNA is in chain 'N' instead of 'L'
+# Use chains A and B as the protein target; all non-protein chains become partner selection
 python clustal_cli.py \
   -m models/ \
   -o results/ \
-  --ligand-id N
+  --protein-chains A,B
 ```
 
 ---
@@ -347,9 +367,6 @@ echo "Results saved to: /scratch/results_${SLURM_JOB_ID}/"
 ```bash
 # Show all options
 python clustal_cli.py --help
-
-# Show version and parameters
-python clustal_cli.py --version
 ```
 
 For issues or questions:

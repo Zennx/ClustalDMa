@@ -11,7 +11,7 @@ An interactive web application for clustering and analyzing AlphaFold2 protein s
 - **Multiple Visualizations**:
   - Jaccard contact similarity heatmaps
   - RMSD distance matrices
-  - 2D projections (MDS, PCA, t-SNE)
+   - 2D/3D projections (MDS, PCA, t-SNE, UMAP, UMAP 3D)
   - HDBSCAN condensed trees for cluster stability
   - Cluster size distributions
 - **Quality Metrics**: Intra-cluster RMSD statistics and binding hotspot analysis
@@ -54,6 +54,10 @@ The app will open in your default browser at `http://127.0.0.1:8000`
 2. **Clustering Parameters**
    - Adjust HDBSCAN `min_cluster_size` (minimum members per cluster)
    - Set `min_samples` (noise threshold parameter)
+   - Set `Cluster Selection Epsilon` (post-selection merge threshold)
+   - Choose `Cluster Selection Method`:
+     - `eom`, `leaf` (precomputed distance matrix)
+     - `mds`, `tsne`, `umap`, `pca` (cluster on 2D embedding, EOM internally)
    - Toggle duplicate filtering for near-identical structures
 
 3. **Run Analysis**
@@ -71,9 +75,10 @@ The app will open in your default browser at `http://127.0.0.1:8000`
 ### Recommended Settings for AlphaFold2
 
 - **Selection**: `nucleic and name P` (for DNA/RNA ligand)
-- **No Alignment**: ✅ Checked (preserves docking poses)
-- **eps**: 10-15 Å (adjust based on ligand flexibility)
-- **min_samples**: 2-3 structures
+- **min_cluster_size**: 5-10 (increase for stricter clusters)
+- **min_samples**: 2-3 (raise to mark more noise)
+- **Cluster Selection Epsilon**: start at `0.0`, then try `0.01-0.05` if over-split
+- **Cluster Selection Method**: start with `eom`; try `mds`/`umap` if matrix-based clustering is too conservative
 
 ## 📊 Output Files
 
@@ -124,20 +129,10 @@ In PyMOL, you can:
 
 ## 🛠️ Advanced Features
 
-### Command-Line Options
+### Command-Line Interface
 
-```
--d, --directories    : Input directories with PDB files
--s, --selection      : MDAnalysis atom selection string
--e, --eps            : DBSCAN epsilon (distance threshold)
--m, --min-samples    : DBSCAN minimum samples
--c, --chain          : Auto-select chain (alternative to -s)
--o, --output-dir     : Output directory
--f, --filter         : Filename filter pattern
---no-align           : Skip alignment before RMSD
---align-selection    : Custom selection for alignment
---use-symlinks       : Use symbolic links instead of copying
-```
+For CLI usage, parameters, and examples, see [CLI_QUICKSTART.md](CLI_QUICKSTART.md).
+The CLI supports `--protein-chains`, `--hdbscan-epsilon`, and `--hdbscan-selection-method`.
 
 ### MDAnalysis Selection Syntax
 

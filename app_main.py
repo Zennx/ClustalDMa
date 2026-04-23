@@ -599,6 +599,23 @@ app_ui = ui.page_fluid(
                            min=2, max=20, value=5, step=1),
             ui.input_slider("min_samples_hdb", "Min Samples (noise threshold):", 
                            min=1, max=10, value=2, step=1),
+            ui.input_slider("hdbscan_epsilon", "Cluster Selection Epsilon:",
+                           min=0.0, max=1.0, value=0.0, step=0.01),
+            ui.input_select(
+                "hdbscan_selection_method",
+                "Cluster Selection Method:",
+                choices={
+                    "eom": "EOM (precomputed distance matrix)",
+                    "leaf": "Leaf (precomputed distance matrix)",
+                    "mds": "MDS 2D embedding (HDBSCAN with EOM)",
+                    "tsne": "t-SNE 2D embedding (HDBSCAN with EOM)",
+                    "umap": "UMAP 2D embedding (HDBSCAN with EOM)",
+                    "pca": "PCA 2D embedding (HDBSCAN with EOM)"
+                },
+                selected="eom"
+            ),
+            ui.tags.small("MDS/t-SNE/UMAP/PCA cluster in 2D embedding space and default to EOM internally; epsilon controls post-selection cluster merging.",
+                         style="color: #6c757d; display: block; margin-top: -5px; margin-bottom: 10px;"),
             ui.input_checkbox("filter_duplicates", "Filter Near-Duplicates", value=True),
             ui.tags.small("Remove very similar structures before clustering (faster, cleaner trees)", 
                          style="color: #6c757d; display: block; margin-top: -5px; margin-bottom: 10px;"),
@@ -719,6 +736,8 @@ app_ui = ui.page_fluid(
                             choices={
                                 "mds": "MDS (Multidimensional Scaling)",
                                 "tsne": "t-SNE (t-Distributed Stochastic Neighbor Embedding)",
+                                "umap": "UMAP (Uniform Manifold Approximation and Projection)",
+                                "umap3d": "UMAP 3D (Plotly Scatter3d)",
                                 "pca": "PCA (Principal Component Analysis)"
                             },
                             selected="mds"
@@ -727,7 +746,9 @@ app_ui = ui.page_fluid(
                         ui.markdown("""
                         **Method Comparison:**
                         - **MDS**: Preserves pairwise distances (best for distance matrices)
-                        - **t-SNE**: Emphasizes local structure, reveals clusters
+                        - **t-SNE**: Emphasizes local structure, reveals clusters (slower)
+                        - **UMAP**: Preserves both local & global structure, faster than t-SNE
+                        - **UMAP 3D**: 3D nonlinear embedding (rotate/zoom in Plotly)
                         - **PCA**: Linear projection, fast but may miss non-linear patterns
                         """),
                         width=300
@@ -945,6 +966,7 @@ def server(input, output, session):
     analysis_complete = reactive.Value(False)  # Track if analysis is done
     status_log = reactive.Value([])  # Terminal-style output log
     current_theme = reactive.Value('dark')  # Track current theme
+    cluster_refresh_tick = reactive.Value(0)  # Forces full plot/card refresh after (re)clustering
     
     # AlphaFold2-specific reactive values
     af2_models_dir = reactive.Value(None)  # Directory containing AF2 models
@@ -957,6 +979,10 @@ def server(input, output, session):
         current_log = status_log.get()
         current_log.append(message)
         status_log.set(current_log)
+
+    def bump_cluster_refresh():
+        """Invalidate all cluster-dependent outputs after clustering state changes."""
+        cluster_refresh_tick.set(cluster_refresh_tick.get() + 1)
 
     def parse_protein_chain_labels(chain_text):
         """Parse comma/space separated chain labels from user input."""
@@ -1406,6 +1432,8 @@ def server(input, output, session):
         # Get HDBSCAN parameters
         min_cluster_size = input.min_cluster_size()
         min_samples_hdb = input.min_samples_hdb()
+        hdbscan_epsilon = input.hdbscan_epsilon()
+        hdbscan_selection_method = input.hdbscan_selection_method()
         
         # Show input acknowledgement
         log_status("="*50)
@@ -1414,6 +1442,8 @@ def server(input, output, session):
         log_status(f"Total structures: {len(model_files)}")
         log_status(f"HDBSCAN min_cluster_size: {min_cluster_size}")
         log_status(f"HDBSCAN min_samples: {min_samples_hdb}")
+        log_status(f"HDBSCAN epsilon: {hdbscan_epsilon}")
+        log_status(f"HDBSCAN selection method: {hdbscan_selection_method}")
         if ref_model:
             log_status(f"Reference model: {os.path.basename(ref_model)}")
         log_status("")
@@ -1628,7 +1658,9 @@ def server(input, output, session):
             clust.cluster_hdbscan(
                 min_cluster_size=min_cluster_size, 
                 min_samples=min_samples_hdb,
-                filter_duplicates=filter_dupes
+                filter_duplicates=filter_dupes,
+                cluster_selection_epsilon=hdbscan_epsilon,
+                cluster_selection_method=hdbscan_selection_method
             )
             
             n_clusters = len(set(clust.labels)) - (1 if -1 in clust.labels else 0)
@@ -1846,6 +1878,8 @@ def server(input, output, session):
             else:
                 # Show all structures
                 ui.update_select("structure_select", choices=structure_names)
+
+            bump_cluster_refresh()
             
             # Set analysis complete flag
             analysis_complete.set(True)
@@ -1884,12 +1918,15 @@ def server(input, output, session):
         # Get new parameters
         min_cluster_size = input.min_cluster_size()
         min_samples_hdb = input.min_samples_hdb()
+        hdbscan_epsilon = input.hdbscan_epsilon()
+        hdbscan_selection_method = input.hdbscan_selection_method()
         filter_dupes = input.filter_duplicates()
         
         log_status("")
         log_status("="*50)
         log_status("🔄 Re-Clustering with new parameters...")
         log_status(f"New min_cluster_size: {min_cluster_size}, New min_samples: {min_samples_hdb}")
+        log_status(f"New epsilon: {hdbscan_epsilon}, Method: {hdbscan_selection_method}")
         log_status(f"Filter duplicates: {filter_dupes}")
         log_status("="*50)
         
@@ -1900,7 +1937,9 @@ def server(input, output, session):
             clust.cluster_hdbscan(
                 min_cluster_size=min_cluster_size, 
                 min_samples=min_samples_hdb,
-                filter_duplicates=filter_dupes
+                filter_duplicates=filter_dupes,
+                cluster_selection_epsilon=hdbscan_epsilon,
+                cluster_selection_method=hdbscan_selection_method
             )
             
             n_clusters = len(set(clust.labels)) - (1 if -1 in clust.labels else 0)
@@ -1908,13 +1947,14 @@ def server(input, output, session):
             log_status(f"✓ Re-clustering complete: {n_clusters} clusters, {n_noise} noise points")
             
             # Recompute cluster statistics with cached RMSD
+            rmsd_qc = None
             rmsd_mat = rmsd_matrix.get()
             if rmsd_mat is not None:
                 rmsd_qc = compute_rmsd_qc(clust.labels, rmsd_mat)
                 rmsd_stats.set(rmsd_qc)
                 log_status("✓ RMSD stats updated")
             
-            # Recompute interface stats (fast - just regrouping)
+            # Recompute interface stats
             stats_df = clust.get_interface_stats()
 
             # Re-attach TM-score per structure if available
@@ -1922,6 +1962,12 @@ def server(input, output, session):
             if tm_df is not None and len(tm_df) > 0:
                 tm_map = dict(zip(tm_df['structure'], tm_df['tm_score']))
                 stats_df['tm_score'] = stats_df['structure'].map(tm_map)
+
+            # Re-attach motif match scores if available
+            if hasattr(clust, 'motif_match_scores') and clust.motif_match_scores is not None:
+                match_scores = clust.motif_match_scores
+                if len(match_scores) > 0 and len(match_scores) == len(stats_df):
+                    stats_df['motif_match_pct'] = match_scores
             
             # Mark representatives
             if rmsd_qc is not None:
@@ -1938,19 +1984,47 @@ def server(input, output, session):
             
             # Store updated stats
             interface_stats.set(stats_df)
+
+            # Recompute hotspots
+            hotspots_df = clust.get_binding_hotspots()
+            hotspots.set(hotspots_df)
+            log_status("✓ Hotspot analysis updated")
             
             # Recompute cluster summary
             log_status("Recomputing cluster summary...")
-            summary = stats_df.groupby('cluster').agg({
-                'n_protein_residues': ['count', 'mean', 'std'],
-                'protein_residues': lambda x: len(set().union(*[set(r.split(',')) for r in x if r]))
-            }).reset_index()
-            
-            summary.columns = ['cluster', 'count', 'mean_contacts', 'std_contacts', 'total_unique_residues']
-            
-            # Add RMSD stats
-            summary_with_rmsd = summary.merge(rmsd_qc[['cluster', 'mean_rmsd', 'std_rmsd', 'medoid_idx']], 
-                                               on='cluster', how='left')
+            summary_df = clust.get_cluster_summary(threshold=50)
+
+            # Add RMSD stats when available
+            if rmsd_qc is not None:
+                summary_with_rmsd = summary_df.merge(
+                    rmsd_qc,
+                    on='cluster',
+                    how='left'
+                )
+            else:
+                summary_with_rmsd = summary_df.copy()
+
+            # Add motif match scores if available
+            if hasattr(clust, 'motif_match_scores') and clust.motif_match_scores is not None:
+                try:
+                    match_scores = clust.motif_match_scores
+                    if len(match_scores) > 0 and any(s is not None for s in match_scores):
+                        match_score_by_cluster = {}
+                        for cid in summary_with_rmsd['cluster'].values:
+                            if cid == -1:
+                                match_score_by_cluster[cid] = 0.0
+                            else:
+                                cluster_indices = [i for i, l in enumerate(clust.labels) if l == cid]
+                                cluster_scores = [match_scores[i] for i in cluster_indices if match_scores[i] is not None]
+                                if len(cluster_scores) > 0:
+                                    match_score_by_cluster[cid] = np.mean(cluster_scores)
+                                else:
+                                    match_score_by_cluster[cid] = 0.0
+
+                        summary_with_rmsd['avg_motif_match'] = summary_with_rmsd['cluster'].map(match_score_by_cluster)
+                        log_status("✓ Motif match scores added to cluster summary")
+                except Exception as e:
+                    log_status(f"⚠️ Could not compute motif match scores: {str(e)}")
 
             # Add average TM-score per cluster
             if 'tm_score' in stats_df.columns:
@@ -1960,17 +2034,73 @@ def server(input, output, session):
                     .rename(columns={'tm_score': 'avg_tm_score'})
                 )
                 summary_with_rmsd = summary_with_rmsd.merge(cluster_tm, on='cluster', how='left')
+
+            # Add cluster stability scores if HDBSCAN clustering was used
+            if hasattr(clust, 'hdbscan_clusterer') and clust.hdbscan_clusterer is not None:
+                try:
+                    persistence_scores = clust.hdbscan_clusterer.cluster_persistence_
+                    cluster_ids_for_stability = [idx for idx in summary_with_rmsd['cluster'].values if idx != -1]
+
+                    if np.all(persistence_scores == 1.0) or np.any(np.isinf(persistence_scores)):
+                        tree_df = clust.hdbscan_clusterer.condensed_tree_.to_pandas()
+                        tree_df_finite = tree_df[np.isfinite(tree_df['lambda_val'])].copy()
+
+                        stability_scores = {}
+                        for cid in cluster_ids_for_stability:
+                            cluster_mask = np.array(clust.labels) == cid
+                            cluster_indices = np.where(cluster_mask)[0]
+
+                            if len(cluster_indices) > 1:
+                                cluster_submatrix = clust.distance_matrix[np.ix_(cluster_indices, cluster_indices)]
+                                upper_tri_indices = np.triu_indices_from(cluster_submatrix, k=1)
+                                cluster_dists = cluster_submatrix[upper_tri_indices]
+                                median_dist = max(np.median(cluster_dists), 1e-6)
+
+                                cluster_point_rows = tree_df_finite[tree_df_finite['child'].isin(cluster_indices)]
+                                if len(cluster_point_rows) > 0:
+                                    lambda_vals = cluster_point_rows['lambda_val'].values
+                                    lambda_vals_finite = lambda_vals[np.isfinite(lambda_vals)]
+                                    if len(lambda_vals_finite) > 1:
+                                        lambda_range = max(lambda_vals_finite.max() - lambda_vals_finite.min(), 1e-6)
+                                        stability = (lambda_range * len(cluster_indices)) / median_dist
+                                    else:
+                                        stability = float(len(cluster_indices)) / median_dist
+                                else:
+                                    stability = float(len(cluster_indices)) / median_dist
+                            else:
+                                stability = 0.0
+
+                            stability_scores[cid] = stability
+                    else:
+                        stability_scores = {cid: score for cid, score in zip(cluster_ids_for_stability, persistence_scores)}
+
+                    summary_with_rmsd['stability_score'] = summary_with_rmsd['cluster'].map(
+                        lambda c: stability_scores.get(c, 0.0) if c != -1 else 0.0
+                    )
+                    log_status("✓ Stability scores added to cluster summary")
+                except Exception as e:
+                    log_status(f"⚠️ Could not compute stability scores: {str(e)}")
             
             cluster_summary.set(summary_with_rmsd)
+            log_status("✓ Cluster summary updated")
             
             # Update selectors
-            cluster_ids = [str(c) for c in sorted(set(clust.labels)) if c != -1]
+            cluster_ids = [str(c) for c in sorted(set(clust.labels))]
             cluster_choices = {}
             for cid in cluster_ids:
                 n_structs = sum(1 for l in clust.labels if l == int(cid))
-                cluster_choices[cid] = f"Cluster {cid} ({n_structs} structures)"
+                if int(cid) == -1:
+                    cluster_choices[cid] = f"Noise ({n_structs} structures)"
+                else:
+                    cluster_choices[cid] = f"Cluster {cid} ({n_structs} structures)"
             # Add "All Clusters" option at the end
             cluster_choices["all"] = "All Clusters (use with caution!)"
+
+            intra_cluster_choices = {}
+            for cid in cluster_ids:
+                if int(cid) >= 0:
+                    n_structs = sum(1 for l in clust.labels if l == int(cid))
+                    intra_cluster_choices[cid] = f"Cluster {cid} ({n_structs} structures)"
             
             # Default to Cluster 1 (second cluster, usually smaller)
             if len(cluster_ids) > 1:
@@ -1979,12 +2109,16 @@ def server(input, output, session):
                 default_cluster = cluster_ids[0]  # Only cluster 0
             else:
                 default_cluster = "all"  # No clusters
+
+            default_intra = next((cid for cid in cluster_ids if int(cid) >= 0), "0")
             
             ui.update_select("filter_cluster", choices=cluster_choices, selected=default_cluster)
             ui.update_select("viewer_cluster", choices=cluster_choices, selected=default_cluster)
             ui.update_select("cluster_select_hotspot", choices=cluster_ids)
-            ui.update_select("contact_heatmap_cluster", choices=cluster_ids, selected=cluster_ids[0] if cluster_ids else "")
-            ui.update_select("sequence_viz_cluster", choices=cluster_ids, selected=cluster_ids[0] if cluster_ids else "")
+            ui.update_select("contact_heatmap_cluster", choices=cluster_ids, selected=default_intra)
+            ui.update_select("jaccard_intra_cluster", choices=intra_cluster_choices, selected=default_intra)
+            ui.update_select("rmsd_intra_cluster", choices=intra_cluster_choices, selected=default_intra)
+            ui.update_select("sequence_viz_cluster", choices=cluster_ids, selected=default_intra)
             
             # Update export cluster dropdown
             export_choices = {}
@@ -2002,6 +2136,8 @@ def server(input, output, session):
                 ui.update_select("structure_select", choices=filtered_names)
             else:
                 ui.update_select("structure_select", choices=structure_names)
+
+            bump_cluster_refresh()
             
             log_status("✓ All statistics updated")
             log_status("="*50)
@@ -2100,6 +2236,7 @@ def server(input, output, session):
     @render.ui
     def cluster_summary_cards():
         """Summary cards showing cluster counts"""
+        _ = cluster_refresh_tick.get()
         if not analysis_complete.get() or clust is None:
             return ui.p("Run analysis to see summary", style="padding: 20px; text-align: center;")
         
@@ -2133,6 +2270,7 @@ def server(input, output, session):
     def structure_quality_cards():
         """Quality metric cards for structure metrics (DBCV, RMSD)"""
         global clust  # Make sure we're accessing the global clust
+        _ = cluster_refresh_tick.get()
         
         rmsd_mat = rmsd_matrix.get()
         
@@ -2226,6 +2364,7 @@ def server(input, output, session):
     @render.ui
     def interface_quality_cards():
         """Quality metric cards for interface metrics"""
+        _ = cluster_refresh_tick.get()
         if not analysis_complete.get() or clust is None:
             return ui.p("Run analysis to see metrics", style="padding: 20px; text-align: center;")
         
@@ -2266,6 +2405,7 @@ def server(input, output, session):
     @output
     @render.data_frame
     def cluster_summary_table():
+        _ = cluster_refresh_tick.get()
         summary_df = cluster_summary.get()
         if summary_df is None or summary_df.empty:
             return pd.DataFrame()
@@ -2342,6 +2482,7 @@ def server(input, output, session):
     @render.ui
 
     def cluster_size_plot():
+        _ = cluster_refresh_tick.get()
         if not analysis_complete.get() or clust is None:
             return ui.p("Run analysis to see cluster sizes", style="padding: 20px; text-align: center;")
         
@@ -2361,6 +2502,7 @@ def server(input, output, session):
     @render.ui
     def cluster_stability_plot():
         """Display HDBSCAN cluster stability (persistence) scores"""
+        _ = cluster_refresh_tick.get()
         if not analysis_complete.get() or clust is None:
             return ui.p("Run analysis to see cluster stability", style="padding: 20px; text-align: center;")
         
@@ -2390,6 +2532,7 @@ def server(input, output, session):
     @render.ui
     def cluster_stability_info():
         """Display stability plot warning text below the plot"""
+        _ = cluster_refresh_tick.get()
         if not analysis_complete.get() or clust is None:
             return None
         
@@ -2430,6 +2573,7 @@ def server(input, output, session):
     @render.ui
     def motif_match_plot():
         """Display motif match score bar chart"""
+        _ = cluster_refresh_tick.get()
         if not analysis_complete.get() or clust is None:
             return ui.p("Run analysis to see motif match scores", style="padding: 20px; text-align: center;")
         
@@ -2452,6 +2596,7 @@ def server(input, output, session):
     @render.ui
     def cluster_diversity_plot():
         """Display pose diversity within clusters (RMSD from medoid)"""
+        _ = cluster_refresh_tick.get()
         if not analysis_complete.get() or clust is None:
             return ui.p("Run analysis to see cluster diversity", style="padding: 20px; text-align: center;")
         
@@ -2479,6 +2624,7 @@ def server(input, output, session):
     @render.ui
     def hdbscan_condensed_tree_plot():
         """Display HDBSCAN condensed tree showing cluster hierarchy and stability"""
+        _ = cluster_refresh_tick.get()
         if not analysis_complete.get() or clust is None:
             return ui.p("Run analysis to see HDBSCAN condensed tree", style="padding: 20px; text-align: center;")
         
@@ -2504,6 +2650,7 @@ def server(input, output, session):
     @render.ui
     def hdbscan_linkage_tree_plot():
         """Display HDBSCAN single linkage tree (dendrogram)"""
+        _ = cluster_refresh_tick.get()
         if not analysis_complete.get() or clust is None:
             return ui.p("Run analysis to see HDBSCAN linkage tree", style="padding: 20px; text-align: center;")
         
@@ -2522,6 +2669,7 @@ def server(input, output, session):
     @output
     @render.ui
     def jaccard_heatmap():
+        _ = cluster_refresh_tick.get()
         if not analysis_complete.get() or clust is None:
             return ui.p("Run analysis to see Jaccard distance matrix", style="padding: 20px; text-align: center;")
         
@@ -2582,6 +2730,7 @@ def server(input, output, session):
     @output
     @render.ui
     def rmsd_heatmap():
+        _ = cluster_refresh_tick.get()
         rmsd_mat = rmsd_matrix.get()
         if not analysis_complete.get() or rmsd_mat is None or clust is None:
             return ui.p("Run analysis to see RMSD distance matrix", style="padding: 20px; text-align: center;")
@@ -2643,6 +2792,7 @@ def server(input, output, session):
     @output
     @render.ui
     def interactive_scatter():
+        _ = cluster_refresh_tick.get()
         stats_df = interface_stats.get()
         if stats_df is None or clust is None:
             return ui.p("Run analysis to see interactive plot", style="padding: 20px; text-align: center;")
@@ -2670,6 +2820,7 @@ def server(input, output, session):
     @output
     @render.ui
     def hotspot_plot_combined():
+        _ = cluster_refresh_tick.get()
         hotspots_df = hotspots.get()
         if hotspots_df is None:
             return ui.p("Run analysis to see hotspot analysis", style="padding: 20px; text-align: center;")
@@ -2686,6 +2837,7 @@ def server(input, output, session):
     @output
     @render.ui
     def hotspot_plots_by_chain():
+        _ = cluster_refresh_tick.get()
         hotspots_df = hotspots.get()
         if hotspots_df is None:
             return ui.p("Run analysis to see per-chain plots", style="padding: 20px; text-align: center;")
@@ -2712,6 +2864,7 @@ def server(input, output, session):
     @render.ui
     def contact_residue_heatmap():
         """Contact residue heatmap showing intra-cluster interaction patterns"""
+        _ = cluster_refresh_tick.get()
         if not analysis_complete.get() or clust is None:
             return ui.p("Run analysis to see contact patterns", style="padding: 20px; text-align: center;")
         
@@ -2751,6 +2904,7 @@ def server(input, output, session):
     @render.ui
     def cluster_hotspot_plot():
         """Per-cluster hotspot plot"""
+        _ = cluster_refresh_tick.get()
         if clust is None or not input.cluster_select_hotspot():
             return ui.p("Select a cluster", style="padding: 20px; text-align: center;")
         
@@ -2791,6 +2945,7 @@ def server(input, output, session):
     @render.ui
     def sequence_alignment_plot():
         """Sequence alignment QC visualization with secondary structure and pLDDT"""
+        _ = cluster_refresh_tick.get()
         if clust is None or not analysis_complete.get():
             return ui.p("Run analysis to view sequence QC", style="padding: 20px; text-align: center;")
         
@@ -2893,6 +3048,7 @@ def server(input, output, session):
     @render.data_frame
     def consensus_residues_table():
         """Table showing consensus residues for each cluster"""
+        _ = cluster_refresh_tick.get()
         summary_df = cluster_summary.get()
         if summary_df is None:
             return pd.DataFrame()
@@ -2941,6 +3097,7 @@ def server(input, output, session):
     @output
     @render.data_frame
     def hotspot_table():
+        _ = cluster_refresh_tick.get()
         hotspots_df = hotspots.get()
         if hotspots_df is None or hotspots_df.empty:
             return pd.DataFrame()
@@ -2953,6 +3110,7 @@ def server(input, output, session):
     @render.ui
     def stats_table_info():
         """Show info about how many rows will be displayed"""
+        _ = cluster_refresh_tick.get()
         stats_df = interface_stats.get()
         if stats_df is None or stats_df.empty:
             return ui.p("")
@@ -2982,6 +3140,7 @@ def server(input, output, session):
     @output
     @render.data_frame
     def stats_table():
+        _ = cluster_refresh_tick.get()
         stats_df = interface_stats.get()
         if stats_df is None or stats_df.empty:
             return pd.DataFrame()
@@ -3104,6 +3263,7 @@ def server(input, output, session):
     @output
     @render.ui
     def structure_info():
+        _ = cluster_refresh_tick.get()
         if clust is None or not input.structure_select():
             return ui.p("")
         
@@ -3138,6 +3298,7 @@ def server(input, output, session):
     @output
     @render.ui
     def structure_viewer():
+        _ = cluster_refresh_tick.get()
         # Cache clust reference at start to prevent it becoming None during render
         clust_ref = clust
         

@@ -296,13 +296,88 @@ class PDBClusterer:
                 print(f"  Representative {rep}: {size} structures ({size-1} duplicates)")
         
         return reduced_matrix, representative_map, duplicate_groups, representative_indices
+
+    def _project_distance_matrix_2d(self, distance_matrix, method='mds'):
+        """
+        Project a precomputed pairwise distance matrix into 2D coordinates.
+
+        Parameters:
+        -----------
+        distance_matrix : np.ndarray
+            Pairwise distance matrix (n x n)
+        method : str
+            Projection method: 'mds', 'tsne', 'umap', or 'pca'
+
+        Returns:
+        --------
+        np.ndarray
+            2D coordinates (n x 2)
+        """
+        method = str(method).strip().lower()
+        if method not in {'mds', 'tsne', 'umap', 'pca'}:
+            raise ValueError("Projection method must be one of: mds, tsne, umap, pca")
+
+        matrix = np.asarray(distance_matrix, dtype=float)
+        n_samples = matrix.shape[0]
+
+        # Tiny datasets cannot be stably projected with nonlinear methods.
+        if n_samples <= 2:
+            return np.column_stack([np.arange(n_samples, dtype=float), np.zeros(n_samples, dtype=float)])
+
+        if method == 'mds':
+            from sklearn.manifold import MDS
+            reducer = MDS(
+                n_components=2,
+                dissimilarity='precomputed',
+                random_state=42,
+                n_init=1,
+                max_iter=300
+            )
+            return reducer.fit_transform(matrix)
+
+        if method == 'tsne':
+            from sklearn.manifold import TSNE
+            perplexity = min(30, max(1, n_samples // 3))
+            if perplexity >= n_samples:
+                perplexity = max(1, n_samples - 1)
+            reducer = TSNE(
+                n_components=2,
+                metric='precomputed',
+                init='random',
+                random_state=42,
+                perplexity=perplexity,
+                learning_rate='auto'
+            )
+            return reducer.fit_transform(matrix)
+
+        if method == 'umap':
+            try:
+                from umap import UMAP
+            except ImportError:
+                raise ImportError("UMAP clustering requested, but umap-learn is not installed. Install with: pip install umap-learn")
+
+            n_neighbors = min(15, max(2, n_samples - 1))
+            reducer = UMAP(
+                n_components=2,
+                metric='precomputed',
+                random_state=42,
+                n_neighbors=n_neighbors
+            )
+            return reducer.fit_transform(matrix)
+
+        # PCA on distance profiles (rows of the pairwise distance matrix).
+        from sklearn.decomposition import PCA
+        reducer = PCA(n_components=2)
+        return reducer.fit_transform(matrix)
     
-    def cluster_hdbscan(self, min_cluster_size=5, min_samples=2, filter_duplicates=True, duplicate_threshold=0.0001):
+    def cluster_hdbscan(self, min_cluster_size=5, min_samples=2,
+                        filter_duplicates=True, duplicate_threshold=0.0001,
+                        cluster_selection_epsilon=0.0, cluster_selection_method='eom'):
         """
         Perform HDBSCAN clustering (Hierarchical DBSCAN)
         
-        HDBSCAN automatically finds optimal clustering without requiring eps parameter.
-        Better for datasets with varying density clusters.
+        HDBSCAN automatically finds optimal clustering and supports
+        optional epsilon-based cluster merging plus EOM/Leaf selection.
         
         Parameters:
         -----------
@@ -314,13 +389,44 @@ class PDBClusterer:
             If True, filter out near-duplicate structures before clustering (default: True)
         duplicate_threshold : float
             Distance threshold for identifying duplicates (default: 0.0001)
+        cluster_selection_epsilon : float
+            Merge clusters within this distance threshold (default: 0.0)
+        cluster_selection_method : str
+            Clustering strategy:
+            - 'eom' or 'leaf': cluster on raw precomputed distance matrix
+            - 'mds', 'tsne', 'umap', 'pca': project to 2D first, then cluster with EOM
         """
         try:
             import hdbscan
         except ImportError:
             raise ImportError("hdbscan not installed. Install with: pip install hdbscan")
+
+        cluster_selection_method = str(cluster_selection_method).strip().lower()
+        projection_methods = {'mds', 'tsne', 'umap', 'pca'}
+
+        if cluster_selection_method in {'eom', 'leaf'}:
+            projection_method = None
+            hdbscan_selection_method = cluster_selection_method
+        elif cluster_selection_method in projection_methods:
+            projection_method = cluster_selection_method
+            hdbscan_selection_method = 'eom'  # Default as requested for 2D methods
+        else:
+            raise ValueError(
+                "cluster_selection_method must be one of: "
+                "eom, leaf, mds, tsne, umap, pca"
+            )
+
+        if cluster_selection_epsilon is None:
+            cluster_selection_epsilon = 0.0
+        cluster_selection_epsilon = float(cluster_selection_epsilon)
+        if cluster_selection_epsilon < 0:
+            raise ValueError("cluster_selection_epsilon must be >= 0")
         
-        print(f"\nPerforming HDBSCAN clustering (min_cluster_size={min_cluster_size}, min_samples={min_samples})...")
+        print(
+            f"\nPerforming HDBSCAN clustering "
+            f"(min_cluster_size={min_cluster_size}, min_samples={min_samples}, "
+            f"epsilon={cluster_selection_epsilon}, method={cluster_selection_method})..."
+        )
         
         if self.distance_matrix is None:
             raise ValueError("No distance matrix available. Run compute_distance_matrix() or compute_jaccard_contact_matrix() first.")
@@ -338,28 +444,49 @@ class PDBClusterer:
             self.duplicate_groups = None
             self.representative_indices = None
         
-        # Use the matrix as-is (duplicate filtering already handles near-zero distances)
-        print(f"DEBUG: Distance range: {matrix_to_cluster[matrix_to_cluster > 0].min():.6e} - {matrix_to_cluster.max():.6f}", flush=True)
-        
         # Convert to pure numpy array (in case it's a DataFrame or has pandas wrappers)
         # This ensures HDBSCAN's internal calculations work with clean numpy arrays
-        import numpy as np
         if hasattr(matrix_to_cluster, 'to_numpy'):
             matrix_to_cluster = matrix_to_cluster.to_numpy()
         elif not isinstance(matrix_to_cluster, np.ndarray):
             matrix_to_cluster = np.asarray(matrix_to_cluster)
+
+        # Use the matrix as-is (duplicate filtering already handles near-zero distances)
+        non_zero = matrix_to_cluster[matrix_to_cluster > 0]
+        if len(non_zero) > 0:
+            print(f"DEBUG: Distance range: {non_zero.min():.6e} - {matrix_to_cluster.max():.6f}", flush=True)
+        else:
+            print("DEBUG: Distance range: all pairwise distances are zero", flush=True)
         print(f"DEBUG: Matrix type after conversion: {type(matrix_to_cluster)}", flush=True)
+
+        # Optional: project pairwise distances to 2D before clustering.
+        data_to_cluster = matrix_to_cluster
+        hdbscan_metric = 'precomputed'
+        if projection_method is not None:
+            print(
+                f"Using {projection_method.upper()} 2D embedding for clustering "
+                f"(HDBSCAN cluster_selection_method defaults to '{hdbscan_selection_method}')",
+                flush=True
+            )
+            data_to_cluster = self._project_distance_matrix_2d(matrix_to_cluster, method=projection_method)
+            hdbscan_metric = 'euclidean'
+            self.clustering_input_mode = f"{projection_method}_2d"
+            self.clustering_projection_2d = data_to_cluster
+        else:
+            self.clustering_input_mode = 'precomputed_distance'
+            self.clustering_projection_2d = None
         
-        # HDBSCAN clustering with precomputed distance matrix
+        # HDBSCAN clustering using either precomputed distances or 2D coordinates.
         # gen_min_span_tree=True is required to compute DBCV (relative_validity_)
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=min_cluster_size,
             min_samples=min_samples,
-            metric='precomputed',
-            cluster_selection_method='eom',  # Excess of Mass - better for varying density
+            metric=hdbscan_metric,
+            cluster_selection_method=hdbscan_selection_method,
+            cluster_selection_epsilon=cluster_selection_epsilon,
             gen_min_span_tree=True  # Required for DBCV calculation
         )
-        reduced_labels = clusterer.fit_predict(matrix_to_cluster)
+        reduced_labels = clusterer.fit_predict(data_to_cluster)
         labels_for_tree = reduced_labels  # This is what matches the condensed tree structure
         
         # Store the clusterer IMMEDIATELY after fitting, before any modifications

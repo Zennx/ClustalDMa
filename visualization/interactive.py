@@ -496,14 +496,20 @@ def create_scatter_multimethod(df, distance_matrix, method='mds'):
     distance_matrix : np.ndarray
         Distance matrix for projection
     method : str
-        Dimensionality reduction method: 'mds', 'tsne', or 'pca'
+        Dimensionality reduction method: 'mds', 'tsne', 'pca', 'umap', or 'umap3d'
     
     Returns:
     --------
     plotly.graph_objects.Figure
     """
-    if distance_matrix.shape[0] <= 2:
-        coords_2d = np.column_stack([np.arange(distance_matrix.shape[0]), np.zeros(distance_matrix.shape[0])])
+    is_3d = method == 'umap3d'
+    n_points = distance_matrix.shape[0]
+
+    if n_points <= 2:
+        if is_3d:
+            coords_2d = np.column_stack([np.arange(n_points), np.zeros(n_points), np.zeros(n_points)])
+        else:
+            coords_2d = np.column_stack([np.arange(n_points), np.zeros(n_points)])
     elif method == 'mds':
         # print(f"Computing MDS projection...")
         mds = MDS(n_components=2, dissimilarity='precomputed', random_state=42, n_init=1, max_iter=300)
@@ -523,7 +529,15 @@ def create_scatter_multimethod(df, distance_matrix, method='mds'):
         try:
             from umap import UMAP
             # print(f"Computing UMAP projection...")
-            reducer = UMAP(n_components=2, metric='precomputed', random_state=42, n_neighbors=min(15, distance_matrix.shape[0]-1))
+            reducer = UMAP(n_components=2, metric='precomputed', random_state=42, n_neighbors=min(15, n_points-1))
+            coords_2d = reducer.fit_transform(distance_matrix)
+        except ImportError:
+            raise ImportError("UMAP not installed. Install with: pip install umap-learn")
+    elif method == 'umap3d':
+        try:
+            from umap import UMAP
+            # print(f"Computing 3D UMAP projection...")
+            reducer = UMAP(n_components=3, metric='precomputed', random_state=42, n_neighbors=min(15, n_points-1))
             coords_2d = reducer.fit_transform(distance_matrix)
         except ImportError:
             raise ImportError("UMAP not installed. Install with: pip install umap-learn")
@@ -554,6 +568,7 @@ def create_scatter_multimethod(df, distance_matrix, method='mds'):
         else:
             cluster_colors[cluster_id] = color_palette[i % len(color_palette)]
     
+    df = df.copy()
     df['color'] = df['cluster'].map(cluster_colors)
     
     # Create figure
@@ -567,32 +582,71 @@ def create_scatter_multimethod(df, distance_matrix, method='mds'):
         
         label = f"Cluster {cluster_id}" if cluster_id != -1 else "Noise"
         
-        fig.add_trace(go.Scatter(
-            x=cluster_coords[:, 0],
-            y=cluster_coords[:, 1],
-            mode='markers',
-            name=label,
-            marker=dict(
-                size=10,
-                color=cluster_colors[cluster_id],
-                line=dict(width=1, color='white')
-            ),
-            text=cluster_hover,
-            hovertemplate='%{text}<extra></extra>'
-        ))
+        if is_3d:
+            fig.add_trace(go.Scatter3d(
+                x=cluster_coords[:, 0],
+                y=cluster_coords[:, 1],
+                z=cluster_coords[:, 2],
+                mode='markers',
+                name=label,
+                marker=dict(
+                    size=5,
+                    color=cluster_colors[cluster_id],
+                    line=dict(width=0.5, color='white')
+                ),
+                text=cluster_hover,
+                hovertemplate='%{text}<extra></extra>'
+            ))
+        else:
+            fig.add_trace(go.Scatter(
+                x=cluster_coords[:, 0],
+                y=cluster_coords[:, 1],
+                mode='markers',
+                name=label,
+                marker=dict(
+                    size=10,
+                    color=cluster_colors[cluster_id],
+                    line=dict(width=1, color='white')
+                ),
+                text=cluster_hover,
+                hovertemplate='%{text}<extra></extra>'
+            ))
     
-    method_name = {'mds': 'MDS', 'tsne': 't-SNE', 'pca': 'PCA', 'umap': 'UMAP'}[method]
-    fig.update_layout(
-        title=f'Cluster Visualization ({method_name} Projection)',
-        xaxis_title=f'{method_name} Component 1',
-        yaxis_title=f'{method_name} Component 2',
-        hovermode='closest',
-        showlegend=True,
-        height=600,
-        template='plotly', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-        xaxis=dict(zerolinecolor='#808080', gridcolor='#e0e0e0'),
-        yaxis=dict(zerolinecolor='#808080', gridcolor='#e0e0e0')
-    )
+    method_name = {
+        'mds': 'MDS',
+        'tsne': 't-SNE',
+        'pca': 'PCA',
+        'umap': 'UMAP',
+        'umap3d': 'UMAP 3D'
+    }[method]
+
+    if is_3d:
+        fig.update_layout(
+            title=f'Cluster Visualization ({method_name} Projection)',
+            hovermode='closest',
+            showlegend=True,
+            height=650,
+            template='plotly',
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            scene=dict(
+                xaxis=dict(title='UMAP Component 1', gridcolor='#e0e0e0', zerolinecolor='#808080'),
+                yaxis=dict(title='UMAP Component 2', gridcolor='#e0e0e0', zerolinecolor='#808080'),
+                zaxis=dict(title='UMAP Component 3', gridcolor='#e0e0e0', zerolinecolor='#808080')
+            )
+        )
+    else:
+        fig.update_layout(
+            title=f'Cluster Visualization ({method_name} Projection)',
+            xaxis_title=f'{method_name} Component 1',
+            yaxis_title=f'{method_name} Component 2',
+            hovermode='closest',
+            showlegend=True,
+            height=600,
+            template='plotly', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+            xaxis=dict(zerolinecolor='#808080', gridcolor='#e0e0e0'),
+            yaxis=dict(zerolinecolor='#808080', gridcolor='#e0e0e0')
+        )
     
     return fig
 
