@@ -3160,7 +3160,7 @@ def server(input, output, session):
             if len(stats_df) > MAX_ROWS:
                 stats_df = stats_df.head(MAX_ROWS).copy()
                 # Add a note in the dataframe
-        
+
         # Create detailed table with contact lists
         display_df = stats_df.copy()
         
@@ -3242,7 +3242,6 @@ def server(input, output, session):
         if 'nucleic_residues' in display_df.columns:
             display_df['Nucleic Contacts'] = display_df['nucleic_residues']
             cols.append('Nucleic Contacts')
-        
         available_cols = [c for c in cols if c in display_df.columns]
         display_df = display_df[available_cols]
         
