@@ -485,7 +485,7 @@ def create_molstar_viewer_html(pdb_file, width=800, height=600,
     return html_template
 
 
-def create_scatter_multimethod(df, distance_matrix, method='mds'):
+def create_scatter_multimethod(df, distance_matrix, method='mds', feature_matrix=None):
     """
     Create interactive scatter plot with multiple dimensionality reduction methods
     
@@ -495,6 +495,8 @@ def create_scatter_multimethod(df, distance_matrix, method='mds'):
         Interface statistics DataFrame
     distance_matrix : np.ndarray
         Distance matrix for projection
+    feature_matrix : np.ndarray, optional
+        Feature coordinates used directly for PCA when available.
     method : str
         Dimensionality reduction method: 'mds', 'tsne', 'pca', 'umap', or 'umap3d'
     
@@ -524,7 +526,9 @@ def create_scatter_multimethod(df, distance_matrix, method='mds'):
     elif method == 'pca':
         # print(f"Computing PCA projection (on distance matrix)...")
         pca = PCA(n_components=2, random_state=42)
-        coords_2d = pca.fit_transform(distance_matrix)
+        coords_2d = pca.fit_transform(
+            feature_matrix if feature_matrix is not None else distance_matrix
+        )
     elif method == 'umap':
         try:
             from umap import UMAP

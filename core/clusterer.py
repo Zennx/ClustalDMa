@@ -4,6 +4,7 @@ Main clustering class for PDB structures
 
 import os
 import numpy as np
+import pandas as pd
 import MDAnalysis as mda
 from sklearn.cluster import DBSCAN
 from scipy.cluster.hierarchy import linkage, fcluster
@@ -101,6 +102,23 @@ class PDBClusterer:
         # Jaccard-specific data
         self.contact_sets = None
         self.contact_residue_pairs = None
+        self.svd_coordinates = None
+        self.svd_loadings = None
+        self.svd_model_coordinates = None
+        self.svd_feature_names = []
+        self.svd_explained_variance_ratio = None
+        self.svd_elbow_components = None
+        self.svd_elbow_variance_ratio = None
+        self.svd_elbow_data = None
+        self.svd_cluster_elbow_data = None
+        self.svd_grid_search_data = None
+        self.svd_optimized_components = None
+        self.svd_optimized_k = None
+        self.svd_cluster_count_target = None
+        self.svd_cluster_count_preferred_range = None
+        self.svd_optimization_threshold_met = None
+        self.svd_isolated_points = None
+        self.snn_network = None
         
         # Residue offset correction
         self.reference_sequence = None  # Full-length reference sequence
@@ -401,6 +419,15 @@ class PDBClusterer:
         except ImportError:
             raise ImportError("hdbscan not installed. Install with: pip install hdbscan")
 
+        self.svd_elbow_components = None
+        self.svd_elbow_variance_ratio = None
+        self.svd_elbow_data = None
+        self.svd_cluster_elbow_data = None
+        self.svd_grid_search_data = None
+        self.svd_optimized_components = None
+        self.svd_optimized_k = None
+        self.svd_optimization_threshold_met = None
+
         cluster_selection_method = str(cluster_selection_method).strip().lower()
         projection_methods = {'mds', 'tsne', 'umap', 'pca'}
 
@@ -608,6 +635,483 @@ class PDBClusterer:
         print("=" * 40)
         
         return self.labels, labels_for_tree # was self.labels
+
+    def cluster_svd_leiden(self, max_components=100, n_neighbors=None,
+                           n_components=None, snn_epsilon=0.0,
+                           prune_edges=False, min_shared_neighbors=1,
+                           optimize_grid=False, optimize_k=False,
+                           max_average_intra_jaccard=0.6):
+        """Cluster contact fingerprints with SVD coordinates and SNN-Leiden.
+
+        The contact matrix is built from the protein residues observed in each
+        structure. SVD provides the continuous representation, and a shared
+        nearest-neighbor graph is partitioned with Leiden. Results needed for
+        inspection and export are retained on this clusterer instance.
+        """
+        if self.contact_residue_pairs is None:
+            raise ValueError("No contact data. Run compute_jaccard_contact_matrix() first.")
+
+        n_structures = len(self.contact_residue_pairs)
+        if n_structures != len(self.pdb_files):
+            raise ValueError(
+                f"Contact data ({n_structures}) does not match structures ({len(self.pdb_files)})."
+            )
+        if n_structures == 0:
+            raise ValueError("No structures available for SVD-Leiden clustering.")
+        self.svd_grid_search_data = None
+        self.svd_optimized_components = None
+        self.svd_optimized_k = None
+        coherence_matrix = getattr(self, 'jaccard_distance_matrix', None)
+        if coherence_matrix is None:
+            coherence_matrix = self.distance_matrix
+        if coherence_matrix is None:
+            raise ValueError("No distance matrix available for coherence scoring.")
+        if max_average_intra_jaccard is not None and max_average_intra_jaccard < 0:
+            raise ValueError("max_average_intra_jaccard must be >= 0 or None.")
+
+        from scipy.sparse import csr_matrix, triu
+        from sklearn.decomposition import TruncatedSVD
+        from sklearn.neighbors import kneighbors_graph
+        import igraph as ig
+        import leidenalg as la
+
+        # Build one binary row per structure and one feature per contacted
+        # protein residue, preserving the structure order used by labels.
+        contact_sets = []
+        for contacts in self.contact_residue_pairs:
+            contact_sets.append({contact['protein_residue'] for contact in contacts})
+
+        feature_names = sorted(set().union(*contact_sets)) if contact_sets else []
+        self.svd_feature_names = feature_names
+        if not feature_names:
+            raise ValueError("No protein-residue contact features were found.")
+
+        feature_index = {feature: index for index, feature in enumerate(feature_names)}
+        feature_matrix = np.zeros((n_structures, len(feature_names)), dtype=float)
+        for row_index, structure_contacts in enumerate(contact_sets):
+            for feature in structure_contacts:
+                feature_matrix[row_index, feature_index[feature]] = 1.0
+
+        sparse_features = csr_matrix(feature_matrix)
+        component_limit = max(1, min(
+            int(max_components), n_structures - 1, len(feature_names)
+        ))
+        if n_components is None or str(n_components).lower() == 'auto':
+            n_components = component_limit
+            svd_probe = TruncatedSVD(n_components=component_limit, random_state=42)
+            svd_probe.fit(sparse_features)
+            variance_curve = svd_probe.explained_variance_ratio_
+            if len(variance_curve) > 2:
+                points = np.column_stack((
+                    np.arange(len(variance_curve)), variance_curve
+                ))
+                line = points[-1] - points[0]
+                line_norm = line / max(np.linalg.norm(line), 1e-12)
+                offsets = points - points[0]
+                projection = np.outer(offsets @ line_norm, line_norm)
+                elbow_distances = np.linalg.norm(offsets - projection, axis=1)
+                n_components = int(np.argmax(elbow_distances) + 1)
+            # A one- or two-component solution is usually dominated by the
+            # first variance spike; retain the practical three-component knee
+            # when the dataset supports it.
+            n_components = max(1, min(component_limit, max(3, n_components)))
+            self.svd_elbow_components = n_components
+            self.svd_elbow_variance_ratio = variance_curve
+        else:
+            n_components = max(1, min(int(n_components), component_limit))
+            svd_probe = TruncatedSVD(n_components=component_limit, random_state=42)
+            svd_probe.fit(sparse_features)
+            self.svd_elbow_components = n_components
+            self.svd_elbow_variance_ratio = svd_probe.explained_variance_ratio_
+        self.svd_elbow_data = pd.DataFrame({
+            'component': np.arange(1, len(self.svd_elbow_variance_ratio) + 1),
+            'explained_variance_ratio': self.svd_elbow_variance_ratio,
+            'selected': np.arange(1, len(self.svd_elbow_variance_ratio) + 1) == n_components
+        })
+
+        svd_model = TruncatedSVD(n_components=n_components, random_state=42)
+        self.svd_coordinates = svd_model.fit_transform(sparse_features)
+        self.svd_explained_variance_ratio = svd_model.explained_variance_ratio_
+        coordinate_columns = [
+            f'component_{index + 1}'
+            for index in range(self.svd_coordinates.shape[1])
+        ]
+        self.svd_model_coordinates = pd.DataFrame(
+            self.svd_coordinates,
+            columns=coordinate_columns
+        )
+        self.svd_model_coordinates.insert(0, 'structure', [
+            os.path.basename(path) for path in self.pdb_files
+        ])
+        self.svd_model_coordinates.insert(
+            0, 'model_index', np.arange(n_structures)
+        )
+
+        loading_matrix = svd_model.components_.T * svd_model.singular_values_
+        loading_columns = [
+            f'component_{index + 1}_loading'
+            for index in range(loading_matrix.shape[1])
+        ]
+        loading_df = pd.DataFrame(loading_matrix, columns=loading_columns)
+        loading_df.insert(0, 'residue', feature_names)
+        loading_df['max_absolute_loading'] = loading_df[loading_columns].abs().max(axis=1)
+        loading_df['dominant_component'] = (
+            loading_df[loading_columns].abs().idxmax(axis=1)
+            .str.replace('_loading', '', regex=False)
+        )
+        self.svd_loadings = loading_df.sort_values(
+            'max_absolute_loading', ascending=False
+        ).reset_index(drop=True)
+
+        # Estimate a useful cluster-count range before the grid search. This
+        # keeps the elbow as a soft validation constraint while graph quality
+        # still decides between otherwise comparable candidates.
+        from sklearn.cluster import KMeans
+        # Scale the cluster-count diagnostic with dataset size so larger
+        # runs do not hide the selected cluster count beyond an arbitrary 20.
+        cluster_probe_max = min(
+            n_structures - 1,
+            max(20, min(100, int(np.ceil(2 * np.sqrt(n_structures)))))
+        )
+        cluster_probe_rows = []
+        if (optimize_grid or optimize_k) and n_structures > 3:
+            for cluster_count in range(1, cluster_probe_max + 1):
+                kmeans = KMeans(n_clusters=cluster_count, random_state=42, n_init=10)
+                kmeans.fit(self.svd_coordinates)
+                cluster_probe_rows.append((cluster_count, float(kmeans.inertia_)))
+        if len(cluster_probe_rows) >= 3:
+            probe_points = np.asarray(cluster_probe_rows, dtype=float)
+            probe_line = probe_points[-1] - probe_points[0]
+            probe_line_norm = probe_line / max(np.linalg.norm(probe_line), 1e-12)
+            probe_offsets = probe_points - probe_points[0]
+            probe_projection = np.outer(
+                probe_offsets @ probe_line_norm, probe_line_norm
+            )
+            probe_distances = np.linalg.norm(
+                probe_offsets - probe_projection, axis=1
+            )
+            cluster_count_target = max(2, int(
+                cluster_probe_rows[int(np.argmax(probe_distances))][0]
+            ))
+        else:
+            cluster_count_target = None
+        cluster_count_min = (
+            max(2, cluster_count_target - 1)
+            if cluster_count_target is not None else None
+        )
+        cluster_count_max = (
+            min(cluster_probe_max, cluster_count_target + 1)
+            if cluster_count_target is not None else None
+        )
+
+        grid_optimized = False
+        if (optimize_grid or optimize_k) and n_structures > 3:
+            if optimize_grid:
+                candidate_components = sorted(set(
+                    max(1, min(component_limit, n_components + offset))
+                    for offset in range(-5, 6)
+                ))
+            else:
+                candidate_components = [n_components]
+            coarse_k_min = 3
+            coarse_k_max = min(30, n_structures - 1)
+            # Use a contiguous k grid so the heatmap represents an actual
+            # rectangular search surface rather than a sparse coarse/fine mix.
+            coarse_k_values = list(range(coarse_k_min, coarse_k_max + 1))
+            if not coarse_k_values:
+                coarse_k_values = [min(3, n_structures - 1)]
+
+            def evaluate_candidate(component_count, candidate_k):
+                candidate_model = TruncatedSVD(
+                    n_components=component_count, random_state=42
+                )
+                candidate_coordinates = candidate_model.fit_transform(sparse_features)
+                effective_k = min(max(1, candidate_k), n_structures - 1)
+                candidate_knn = kneighbors_graph(
+                    candidate_coordinates,
+                    n_neighbors=effective_k,
+                    mode='connectivity',
+                    include_self=True
+                )
+                candidate_snn = candidate_knn.dot(candidate_knn.T).tocsr()
+                if float(snn_epsilon) < 0:
+                    raise ValueError("snn_epsilon must be >= 0")
+                if prune_edges:
+                    minimum_weight = max(float(snn_epsilon), float(min_shared_neighbors))
+                    candidate_snn.data[candidate_snn.data < minimum_weight] = 0
+                    candidate_snn.eliminate_zeros()
+                candidate_snn = candidate_snn.tolil()
+                candidate_snn.setdiag(0)
+                candidate_snn = candidate_snn.tocsr()
+                upper_candidate_snn = triu(candidate_snn, k=1).tocsr()
+                sources, targets = upper_candidate_snn.nonzero()
+                graph = ig.Graph(n=n_structures, directed=False)
+                if len(sources) == 0:
+                    labels = np.arange(n_structures, dtype=int)
+                    modularity = 0.0
+                else:
+                    graph.add_edges(
+                        list(zip(sources.tolist(), targets.tolist())),
+                        attributes={'weight': upper_candidate_snn.data.tolist()}
+                    )
+                    partition = la.find_partition(
+                        graph, la.ModularityVertexPartition,
+                        weights='weight', seed=42
+                    )
+                    labels = np.asarray(partition.membership, dtype=int)
+                    modularity = float(partition.modularity)
+
+                cluster_distances = []
+                for cluster_id in np.unique(labels):
+                    members = np.flatnonzero(labels == cluster_id)
+                    if len(members) > 1:
+                        distances = coherence_matrix[np.ix_(members, members)]
+                        cluster_distances.extend(
+                            distances[np.triu_indices(len(members), k=1)].tolist()
+                        )
+                average_intra_jaccard = (
+                    float(np.mean(cluster_distances))
+                    if cluster_distances else np.inf
+                )
+                cluster_sizes = np.bincount(labels)
+                return {
+                    'n_components': component_count,
+                    'k': effective_k,
+                    'n_clusters': int(len(np.unique(labels))),
+                    'average_intra_jaccard': average_intra_jaccard,
+                    'modularity': modularity,
+                    'largest_cluster_fraction': float(cluster_sizes.max() / n_structures),
+                    'valid': bool(
+                        len(np.unique(labels)) >= 2 and len(cluster_distances) > 0
+                    ),
+                    'stability': np.nan,
+                    'labels': labels,
+                    'coordinates': candidate_coordinates
+                }
+
+            grid_rows = []
+            for component_count in candidate_components:
+                for candidate_k in coarse_k_values:
+                    grid_rows.append(evaluate_candidate(component_count, candidate_k))
+            valid_rows = [row for row in grid_rows if row['valid']]
+            if valid_rows:
+                from sklearn.metrics import adjusted_rand_score
+                for row in grid_rows:
+                    neighboring_rows = [
+                        other for other in grid_rows
+                        if other is not row and
+                        abs(other['n_components'] - row['n_components']) +
+                        abs(other['k'] - row['k']) <= 2
+                    ]
+                    row['stability'] = (
+                        float(np.mean([
+                            adjusted_rand_score(row['labels'], other['labels'])
+                            for other in neighboring_rows
+                        ])) if neighboring_rows else 0.0
+                    )
+                valid_rows = [row for row in grid_rows if row['valid']]
+                threshold_rows = [
+                    row for row in valid_rows
+                    if max_average_intra_jaccard is None or
+                    row['average_intra_jaccard'] <= max_average_intra_jaccard
+                ]
+                selection_pool = threshold_rows or valid_rows
+                elbow_rows = [
+                    row for row in selection_pool
+                    if cluster_count_min is not None and
+                    cluster_count_min <= row['n_clusters'] <= cluster_count_max
+                ]
+                if elbow_rows:
+                    selection_pool = elbow_rows
+                # The heatmap's primary metric must also drive selection.
+                # Modularity and stability are useful tie-breakers, not a
+                # reason to choose a visibly worse intra-cluster distance.
+                best_row = min(
+                    selection_pool,
+                    key=lambda row: (
+                        row['average_intra_jaccard'],
+                        -row['stability'],
+                        -row['modularity'],
+                        row['largest_cluster_fraction'],
+                        abs(row['n_clusters'] - (cluster_count_target or row['n_clusters']))
+                    )
+                )
+                n_components = best_row['n_components']
+                neighbor_count = best_row['k']
+                self.svd_grid_search_data = pd.DataFrame([
+                    {key: value for key, value in row.items()
+                     if key not in {'labels', 'coordinates'}}
+                    for row in grid_rows
+                ]).drop_duplicates(subset=['n_components', 'k'])
+                self.svd_grid_search_data['selected'] = (
+                    (self.svd_grid_search_data['n_components'] == n_components) &
+                    (self.svd_grid_search_data['k'] == neighbor_count)
+                )
+                self.svd_grid_search_data['cluster_count_target'] = cluster_count_target
+                self.svd_grid_search_data['cluster_count_preferred'] = (
+                    self.svd_grid_search_data['n_clusters'].between(
+                        cluster_count_min, cluster_count_max
+                    ) if cluster_count_target is not None else False
+                )
+                self.svd_cluster_count_target = cluster_count_target
+                self.svd_cluster_count_preferred_range = (
+                    (cluster_count_min, cluster_count_max)
+                    if cluster_count_target is not None else None
+                )
+                self.svd_coordinates = best_row['coordinates']
+                self.svd_optimized_components = n_components
+                self.svd_optimized_k = neighbor_count
+                self.svd_optimization_threshold_met = bool(threshold_rows)
+                grid_optimized = True
+                print(
+                    f"Grid optimization selected components={n_components}, "
+                    f"k={neighbor_count}, average intra-Jaccard="
+                    f"{best_row['average_intra_jaccard']:.4f}"
+                )
+
+        if grid_optimized:
+            # Refit the selected representation so coordinates and feature
+            # loadings correspond to the optimized component count.
+            svd_model = TruncatedSVD(n_components=n_components, random_state=42)
+            self.svd_coordinates = svd_model.fit_transform(sparse_features)
+            self.svd_explained_variance_ratio = svd_model.explained_variance_ratio_
+            coordinate_columns = [
+                f'component_{index + 1}'
+                for index in range(self.svd_coordinates.shape[1])
+            ]
+            self.svd_model_coordinates = pd.DataFrame(
+                self.svd_coordinates, columns=coordinate_columns
+            )
+            self.svd_model_coordinates.insert(0, 'structure', [
+                os.path.basename(path) for path in self.pdb_files
+            ])
+            self.svd_model_coordinates.insert(0, 'model_index', np.arange(n_structures))
+            loading_matrix = svd_model.components_.T * svd_model.singular_values_
+            loading_columns = [
+                f'component_{index + 1}_loading'
+                for index in range(loading_matrix.shape[1])
+            ]
+            loading_df = pd.DataFrame(loading_matrix, columns=loading_columns)
+            loading_df.insert(0, 'residue', feature_names)
+            loading_df['max_absolute_loading'] = loading_df[loading_columns].abs().max(axis=1)
+            loading_df['dominant_component'] = (
+                loading_df[loading_columns].abs().idxmax(axis=1)
+                .str.replace('_loading', '', regex=False)
+            )
+            self.svd_loadings = loading_df.sort_values(
+                'max_absolute_loading', ascending=False
+            ).reset_index(drop=True)
+
+        if n_structures == 1:
+            self.snn_network = csr_matrix((1, 1), dtype=float)
+            self.svd_isolated_points = pd.DataFrame({
+                'model_index': [0],
+                'structure': [os.path.basename(self.pdb_files[0])],
+                'network_degree': [0]
+            })
+            self.labels = np.array([0], dtype=int)
+            self.metric_name = "SVD-SNN-Leiden"
+            self.metric_unit = "contact features"
+            return self.labels
+
+        if grid_optimized:
+            neighbor_count = self.svd_optimized_k
+        elif n_neighbors is None or str(n_neighbors).lower() == 'auto':
+            neighbor_count = min(max(2, int(np.sqrt(n_structures))), n_structures - 1)
+        else:
+            neighbor_count = min(max(1, int(n_neighbors)), n_structures - 1)
+        # Conventional elbow diagnostic: vary the number of clusters and
+        # measure KMeans inertia (WCSS) on the same SVD coordinates.
+        from sklearn.cluster import KMeans
+        cluster_sweep_max = cluster_probe_max
+        cluster_elbow_rows = []
+        for cluster_count in range(1, cluster_sweep_max + 1):
+            kmeans = KMeans(n_clusters=cluster_count, random_state=42, n_init=10)
+            kmeans.fit(self.svd_coordinates)
+            cluster_elbow_rows.append({
+                'n_clusters': cluster_count,
+                'wcss': float(kmeans.inertia_),
+                'wcss_per_point': float(kmeans.inertia_ / n_structures),
+                'selected': False
+            })
+        self.svd_cluster_elbow_data = pd.DataFrame(cluster_elbow_rows)
+
+        knn_graph = kneighbors_graph(
+            self.svd_coordinates,
+            n_neighbors=neighbor_count,
+            mode='connectivity',
+            include_self=True
+        )
+        snn_matrix_with_self = knn_graph.dot(knn_graph.T).tocsr()
+        snn_matrix = snn_matrix_with_self.copy().tolil()
+        snn_matrix.setdiag(0)
+        snn_matrix = snn_matrix.tocsr()
+        if float(snn_epsilon) < 0:
+            raise ValueError("snn_epsilon must be >= 0")
+        if prune_edges:
+            minimum_weight = max(float(snn_epsilon), float(min_shared_neighbors))
+            snn_network_data = snn_matrix.data
+            snn_matrix.data[snn_network_data < minimum_weight] = 0
+            snn_matrix.eliminate_zeros()
+        network_degree = np.asarray((snn_matrix > 0).sum(axis=1)).ravel()
+        isolated_indices = np.flatnonzero(network_degree == 0)
+        self.snn_network = snn_matrix
+        self.svd_isolated_points = pd.DataFrame({
+            'model_index': isolated_indices,
+            'structure': [os.path.basename(self.pdb_files[index]) for index in isolated_indices],
+            'network_degree': network_degree[isolated_indices]
+        })
+
+        # Use one undirected edge per shared-neighbor pair for Leiden, matching
+        # the graph representation used during grid evaluation.
+        clean_snn = snn_matrix
+        upper_snn = triu(clean_snn, k=1).tocsr()
+        sources, targets = upper_snn.nonzero()
+        weights = upper_snn.data
+
+        if len(sources) == 0:
+            cluster_labels = np.arange(n_structures, dtype=int)
+        else:
+            import igraph as ig
+            import leidenalg as la
+
+            graph = ig.Graph(n=n_structures, directed=False)
+            graph.add_edges(
+                list(zip(sources.tolist(), targets.tolist())),
+                attributes={'weight': weights.tolist()}
+            )
+            partition = la.find_partition(
+                graph,
+                la.ModularityVertexPartition,
+                weights='weight',
+                seed=42
+            )
+            cluster_labels = np.asarray(partition.membership, dtype=int)
+
+        self.labels = cluster_labels
+        self.svd_cluster_elbow_data['selected'] = (
+            self.svd_cluster_elbow_data['n_clusters'] == len(np.unique(cluster_labels))
+        )
+        self.labels_reduced = None
+        self.hdbscan_clusterer = None
+        self.representative_indices = None
+        self.representative_map = None
+        self.duplicate_groups = None
+        self.rescued_cluster_ids = set()
+        self.clustering_input_mode = "svd_snn"
+        self.clustering_projection_2d = self.svd_coordinates
+        self.svd_n_neighbors = neighbor_count
+        self.svd_snn_epsilon = float(snn_epsilon)
+        self.svd_prune_edges = bool(prune_edges)
+        self.svd_min_shared_neighbors = int(min_shared_neighbors)
+        self.metric_name = "SVD-SNN-Leiden"
+        self.metric_unit = "contact features"
+
+        print(
+            f"SVD-SNN-Leiden detected {len(np.unique(cluster_labels))} clusters "
+            f"from {n_structures} structures; {len(isolated_indices)} isolated points."
+        )
+        return self.labels
     
     def cluster_dbscan(self, eps=2.0, min_samples=2):
         """
