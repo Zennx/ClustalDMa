@@ -594,28 +594,71 @@ app_ui = ui.page_fluid(
             ui.tags.small("Enable for 'chopped' AlphaFold models (extracts offset from filename/alignment)", 
                          style="color: #6c757d; display: block; margin-top: -5px; margin-bottom: 10px;"),
             ui.hr(),
-            ui.h5("Clustering (HDBSCAN)"),
-            ui.input_slider("min_cluster_size", "Min Cluster Size:", 
-                           min=2, max=20, value=5, step=1),
-            ui.input_slider("min_samples_hdb", "Min Samples (noise threshold):", 
-                           min=1, max=10, value=2, step=1),
-            ui.input_slider("hdbscan_epsilon", "Cluster Selection Epsilon:",
-                           min=0.0, max=1.0, value=0.0, step=0.01),
+            ui.h5("Clustering"),
             ui.input_select(
-                "hdbscan_selection_method",
-                "Cluster Selection Method:",
+                "clustering_method",
+                "Clustering Method:",
                 choices={
-                    "eom": "EOM (precomputed distance matrix)",
-                    "leaf": "Leaf (precomputed distance matrix)",
-                    "mds": "MDS 2D embedding (HDBSCAN with EOM)",
-                    "tsne": "t-SNE 2D embedding (HDBSCAN with EOM)",
-                    "umap": "UMAP 2D embedding (HDBSCAN with EOM)",
-                    "pca": "PCA 2D embedding (HDBSCAN with EOM)"
+                    "hdbscan": "HDBSCAN",
+                    "svd_leiden": "SVD + SNN-Leiden"
                 },
-                selected="eom"
+                selected="hdbscan"
             ),
-            ui.tags.small("MDS/t-SNE/UMAP/PCA cluster in 2D embedding space and default to EOM internally; epsilon controls post-selection cluster merging.",
+            ui.tags.small("SVD + SNN-Leiden clusters binary protein-residue contact fingerprints and exposes feature loadings.",
                          style="color: #6c757d; display: block; margin-top: -5px; margin-bottom: 10px;"),
+            ui.panel_conditional(
+                "input.clustering_method === 'svd_leiden'",
+                ui.input_select(
+                    "svd_optimization_mode", "SNN optimization strategy:",
+                    choices={
+                        "grid": "Grid search: SVD components + k",
+                        "one_dim": "1D optimization: k only",
+                        "manual": "Manual SVD components + k"
+                    },
+                    selected="grid"
+                ),
+                ui.panel_conditional(
+                    "input.svd_optimization_mode === 'manual'",
+                    ui.input_numeric("svd_manual_components", "SVD components:", value=5, min=1, step=1),
+                    ui.input_numeric("svd_manual_k", "SNN k:", value=20, min=1, step=1)
+                ),
+                ui.input_numeric("svd_snn_epsilon", "SNN edge epsilon:", value=0, min=0, step=1),
+                ui.input_numeric(
+                    "svd_max_intra_jaccard",
+                    "Maximum acceptable average intracluster Jaccard distance:",
+                    value=0.6,
+                    min=0,
+                    max=1,
+                    step=0.05
+                ),
+                ui.input_checkbox("svd_prune_edges", "Prune weak SNN edges", value=False),
+                ui.panel_conditional(
+                    "input.svd_prune_edges === true",
+                    ui.input_numeric("svd_min_shared_neighbors", "Minimum shared neighbors:", value=1, min=1, step=1)
+                ),
+                ui.tags.small("Optimization prefers clean-graph modularity and stability, subject to the Jaccard distance ceiling. Manual mode uses the supplied values.",
+                             style="color: #6c757d; display: block; margin-top: 5px; margin-bottom: 10px;")
+            ),
+            ui.panel_conditional(
+                "input.clustering_method === 'hdbscan'",
+                ui.input_slider("min_cluster_size", "Min Cluster Size:", min=2, max=20, value=5, step=1),
+                ui.input_slider("min_samples_hdb", "Min Samples (noise threshold):", min=1, max=10, value=2, step=1),
+                ui.input_slider("hdbscan_epsilon", "Cluster Selection Epsilon:", min=0.0, max=1.0, value=0.0, step=0.01),
+                ui.input_select(
+                    "hdbscan_selection_method", "Cluster Selection Method:",
+                    choices={
+                        "eom": "EOM (precomputed distance matrix)",
+                        "leaf": "Leaf (precomputed distance matrix)",
+                        "mds": "MDS 2D embedding (HDBSCAN with EOM)",
+                        "tsne": "t-SNE 2D embedding (HDBSCAN with EOM)",
+                        "umap": "UMAP 2D embedding (HDBSCAN with EOM)",
+                        "pca": "PCA 2D embedding (HDBSCAN with EOM)"
+                    },
+                    selected="eom"
+                ),
+                ui.tags.small("Epsilon controls HDBSCAN cluster merging; projection choices cluster in the selected 2D embedding.",
+                             style="color: #6c757d; display: block; margin-top: -5px; margin-bottom: 10px;")
+            ),
             ui.input_checkbox("filter_duplicates", "Filter Near-Duplicates", value=True),
             ui.tags.small("Remove very similar structures before clustering (faster, cleaner trees)", 
                          style="color: #6c757d; display: block; margin-top: -5px; margin-bottom: 10px;"),
@@ -660,6 +703,17 @@ app_ui = ui.page_fluid(
                     ui.card_header("Cluster Summary Table with RMSD QC"),
                     ui.input_text("cluster_search", "Search table:", placeholder="Type to filter..."),
                     ui.output_data_frame("cluster_summary_table")
+                ),
+                ui.hr(),
+                ui.card(
+                    ui.card_header("SVD + SNN-Leiden Diagnostics"),
+                    ui.output_ui("svd_diagnostics_info"),
+                    ui.output_ui("svd_elbow_plot"),
+                    ui.output_ui("svd_grid_search_table"),
+                    ui.output_ui("svd_cluster_elbow_plot"),
+                    ui.output_data_frame("svd_loadings_table"),
+                    ui.output_data_frame("svd_isolated_points_table"),
+                    ui.output_data_frame("svd_model_coordinates_table")
                 ),
                 ui.hr(),
                 ui.card(
@@ -962,6 +1016,9 @@ def server(input, output, session):
     rmsd_stats = reactive.Value(None)
     rmsd_matrix = reactive.Value(None)
     tm_score_stats = reactive.Value(None)
+    svd_loadings = reactive.Value(None)
+    svd_isolated_points = reactive.Value(None)
+    svd_model_coordinates = reactive.Value(None)
     current_motif = reactive.Value(None)  # Store motif for visualization
     analysis_complete = reactive.Value(False)  # Track if analysis is done
     status_log = reactive.Value([])  # Terminal-style output log
@@ -979,6 +1036,41 @@ def server(input, output, session):
         current_log = status_log.get()
         current_log.append(message)
         status_log.set(current_log)
+
+    def read_optional_input(name, default):
+        """Read a conditionally rendered input without triggering SilentException."""
+        try:
+            value = getattr(input, name)()
+        except Exception:
+            return default
+        return default if value is None else value
+
+    def get_svd_settings():
+        """Resolve the explicit SNN strategy into clusterer arguments."""
+        mode = read_optional_input('svd_optimization_mode', 'grid')
+        if mode == 'manual':
+            return {
+                'n_components': read_optional_input('svd_manual_components', 5),
+                'n_neighbors': read_optional_input('svd_manual_k', 20),
+                'optimize_grid': False,
+                'optimize_k': False,
+                'mode': mode
+            }
+        if mode == 'one_dim':
+            return {
+                'n_components': 'auto',
+                'n_neighbors': 'auto',
+                'optimize_grid': False,
+                'optimize_k': True,
+                'mode': mode
+            }
+        return {
+            'n_components': 'auto',
+            'n_neighbors': 'auto',
+            'optimize_grid': True,
+            'optimize_k': False,
+            'mode': 'grid'
+        }
 
     def bump_cluster_refresh():
         """Invalidate all cluster-dependent outputs after clustering state changes."""
@@ -1260,6 +1352,19 @@ def server(input, output, session):
             if tm_score_stats.get() is not None:
                 csv_buffer = tm_score_stats.get().to_csv(index=False)
                 zipf.writestr("tm_score_vs_reference.csv", csv_buffer)
+
+            if svd_loadings.get() is not None:
+                zipf.writestr("svd_residue_feature_loadings.csv", svd_loadings.get().to_csv(index=False))
+            if svd_isolated_points.get() is not None:
+                zipf.writestr("svd_isolated_network_points.csv", svd_isolated_points.get().to_csv(index=False))
+            if svd_model_coordinates.get() is not None:
+                zipf.writestr("svd_model_coordinates.csv", svd_model_coordinates.get().to_csv(index=False))
+            if getattr(clust, 'svd_elbow_data', None) is not None:
+                zipf.writestr("svd_elbow_curve.csv", clust.svd_elbow_data.to_csv(index=False))
+            if getattr(clust, 'svd_cluster_elbow_data', None) is not None:
+                zipf.writestr("svd_cluster_count_wcss_curve.csv", clust.svd_cluster_elbow_data.to_csv(index=False))
+            if getattr(clust, 'svd_grid_search_data', None) is not None:
+                zipf.writestr("svd_component_k_grid_search.csv", clust.svd_grid_search_data.to_csv(index=False))
             
             # Add plots as HTML
             try:
@@ -1647,21 +1752,67 @@ def server(input, output, session):
             # Store motif for later use in visualization
             current_motif.set(motif_dict)
             
-            # STEP 3: Cluster by Jaccard only
-            log_status("STEP 3: Clustering by Jaccard distance...")
-            ui.notification_show("🎯 STEP 3: Running HDBSCAN clustering...", type="message", duration=3)
+            # STEP 3: Cluster by Jaccard-derived contact features
+            clustering_method = input.clustering_method()
+            log_status(f"STEP 3: Clustering using {clustering_method}...")
+            ui.notification_show(
+                "🎯 STEP 3: Running SVD + SNN-Leiden..." if clustering_method == "svd_leiden"
+                else "🎯 STEP 3: Running HDBSCAN clustering...",
+                type="message",
+                duration=3
+            )
             # Restore Jaccard matrix for clustering
             clust.distance_matrix = clust.jaccard_distance_matrix
             clust.metric_name = "Jaccard"
             
             filter_dupes = input.filter_duplicates()
-            clust.cluster_hdbscan(
-                min_cluster_size=min_cluster_size, 
-                min_samples=min_samples_hdb,
-                filter_duplicates=filter_dupes,
-                cluster_selection_epsilon=hdbscan_epsilon,
-                cluster_selection_method=hdbscan_selection_method
-            )
+            if clustering_method == "svd_leiden":
+                svd_settings = get_svd_settings()
+                clust.cluster_svd_leiden(
+                    n_components=svd_settings['n_components'],
+                    n_neighbors=svd_settings['n_neighbors'],
+                    snn_epsilon=read_optional_input('svd_snn_epsilon', 0),
+                    prune_edges=read_optional_input('svd_prune_edges', False),
+                    min_shared_neighbors=read_optional_input('svd_min_shared_neighbors', 1),
+                    optimize_grid=svd_settings['optimize_grid'],
+                    optimize_k=svd_settings['optimize_k'],
+                    max_average_intra_jaccard=read_optional_input('svd_max_intra_jaccard', 0.6)
+                )
+                log_status(
+                    f"✓ SVD components: {clust.svd_coordinates.shape[1]}, "
+                    f"contact features: {len(clust.svd_feature_names)}, "
+                    f"k={clust.svd_n_neighbors}, strategy={svd_settings['mode']}"
+                )
+                log_status(
+                    f"✓ Isolated SNN points: {len(clust.svd_isolated_points)}"
+                )
+                if svd_settings['optimize_grid'] or svd_settings['optimize_k']:
+                    threshold_status = "met" if clust.svd_optimization_threshold_met else "not met; best valid candidate used"
+                    log_status(
+                        f"✓ Optimization threshold {threshold_status} "
+                        f"(max average intracluster Jaccard={read_optional_input('svd_max_intra_jaccard', 0.6):.2f})"
+                    )
+                    cluster_target = getattr(clust, 'svd_cluster_count_target', None)
+                    cluster_range = getattr(clust, 'svd_cluster_count_preferred_range', None)
+                    if cluster_target is not None and cluster_range is not None:
+                        log_status(
+                            f"✓ WCSS elbow recommendation: {cluster_target} clusters "
+                            f"(preferred range {cluster_range[0]}-{cluster_range[1]})"
+                        )
+                svd_loadings.set(clust.svd_loadings)
+                svd_isolated_points.set(clust.svd_isolated_points)
+                svd_model_coordinates.set(clust.svd_model_coordinates)
+            else:
+                clust.cluster_hdbscan(
+                    min_cluster_size=min_cluster_size,
+                    min_samples=min_samples_hdb,
+                    filter_duplicates=filter_dupes,
+                    cluster_selection_epsilon=hdbscan_epsilon,
+                    cluster_selection_method=hdbscan_selection_method
+                )
+                svd_loadings.set(None)
+                svd_isolated_points.set(None)
+                svd_model_coordinates.set(None)
             
             n_clusters = len(set(clust.labels)) - (1 if -1 in clust.labels else 0)
             n_noise = sum(1 for l in clust.labels if l == -1)
@@ -1934,13 +2085,33 @@ def server(input, output, session):
             # Re-cluster using CACHED Jaccard matrix (instant!)
             clust.distance_matrix = clust.jaccard_distance_matrix
             clust.metric_name = "Jaccard"
-            clust.cluster_hdbscan(
-                min_cluster_size=min_cluster_size, 
-                min_samples=min_samples_hdb,
-                filter_duplicates=filter_dupes,
-                cluster_selection_epsilon=hdbscan_epsilon,
-                cluster_selection_method=hdbscan_selection_method
-            )
+            clustering_method = input.clustering_method()
+            if clustering_method == "svd_leiden":
+                svd_settings = get_svd_settings()
+                clust.cluster_svd_leiden(
+                    n_components=svd_settings['n_components'],
+                    n_neighbors=svd_settings['n_neighbors'],
+                    snn_epsilon=read_optional_input('svd_snn_epsilon', 0),
+                    prune_edges=read_optional_input('svd_prune_edges', False),
+                    min_shared_neighbors=read_optional_input('svd_min_shared_neighbors', 1),
+                    optimize_grid=svd_settings['optimize_grid'],
+                    optimize_k=svd_settings['optimize_k'],
+                    max_average_intra_jaccard=read_optional_input('svd_max_intra_jaccard', 0.6)
+                )
+                svd_loadings.set(clust.svd_loadings)
+                svd_isolated_points.set(clust.svd_isolated_points)
+                svd_model_coordinates.set(clust.svd_model_coordinates)
+            else:
+                clust.cluster_hdbscan(
+                    min_cluster_size=min_cluster_size,
+                    min_samples=min_samples_hdb,
+                    filter_duplicates=filter_dupes,
+                    cluster_selection_epsilon=hdbscan_epsilon,
+                    cluster_selection_method=hdbscan_selection_method
+                )
+                svd_loadings.set(None)
+                svd_isolated_points.set(None)
+                svd_model_coordinates.set(None)
             
             n_clusters = len(set(clust.labels)) - (1 if -1 in clust.labels else 0)
             n_noise = sum(1 for l in clust.labels if l == -1)
@@ -2477,6 +2648,227 @@ def server(input, output, session):
                 display_df[col] = display_df[col].apply(lambda x: f"{x:.4g}" if pd.notna(x) else x)
         
         return render.DataGrid(display_df, width="100%", height=400)
+
+    @output
+    @render.ui
+    def svd_diagnostics_info():
+        _ = cluster_refresh_tick.get()
+        loading_df = svd_loadings.get()
+        if loading_df is None:
+            return ui.p(
+                "Select SVD + SNN-Leiden and run analysis to populate diagnostics.",
+                style="padding: 10px; color: #999;"
+            )
+
+        explained = getattr(clust, 'svd_explained_variance_ratio', None)
+        explained_total = float(np.sum(explained)) if explained is not None else 0.0
+        isolated_df = svd_isolated_points.get()
+        return ui.p(
+            f"{len(explained) if explained is not None else 0} components | "
+            f"{len(getattr(clust, 'svd_feature_names', []))} residue features | "
+            f"{explained_total:.1%} variance retained | "
+            f"{len(isolated_df) if isolated_df is not None else 0} isolated network points",
+            style="padding: 10px; color: #b0b0b0;"
+        )
+
+    @output
+    @render.ui
+    def svd_elbow_plot():
+        _ = cluster_refresh_tick.get()
+        variance_curve = getattr(clust, 'svd_elbow_variance_ratio', None) if clust is not None else None
+        if variance_curve is None:
+            return ui.p("Run SVD + SNN-Leiden to view the component elbow plot.", style="padding: 10px; color: #999;")
+        try:
+            import plotly.graph_objects as go
+            component_numbers = np.arange(1, len(variance_curve) + 1)
+            selected = getattr(clust, 'svd_elbow_components', None)
+            fig = go.Figure(go.Scatter(
+                x=component_numbers,
+                y=variance_curve,
+                mode='lines+markers',
+                name='Explained variance ratio'
+            ))
+            if selected is not None:
+                fig.add_vline(x=selected, line_dash='dash', line_color='red')
+                fig.add_annotation(x=selected, y=float(variance_curve[selected - 1]),
+                                   text=f"Selected: {selected}", showarrow=True)
+            fig.update_layout(
+                title='SVD Component Elbow',
+                xaxis_title='Component',
+                yaxis_title='Explained variance ratio',
+                height=350,
+                template='plotly',
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)'
+            )
+            return ui.HTML(fig.to_html(full_html=False, include_plotlyjs='require', div_id='svd_elbow'))
+        except Exception as error:
+            return ui.HTML(f"<pre style='color: red;'>SVD elbow plot error: {error}</pre>")
+
+    @output
+    @render.ui
+    def svd_grid_search_table():
+        _ = cluster_refresh_tick.get()
+        grid_df = getattr(clust, 'svd_grid_search_data', None) if clust is not None else None
+        if grid_df is None or grid_df.empty:
+            return ui.p(
+                "Enable grid optimization and run SVD + SNN-Leiden to view the heatmap.",
+                style="padding: 10px; color: #999;"
+            )
+        try:
+            import plotly.graph_objects as go
+
+            score_pivot = grid_df.pivot(
+                index='n_components', columns='k', values='average_intra_jaccard'
+            ).sort_index()
+            cluster_pivot = grid_df.pivot(
+                index='n_components', columns='k', values='n_clusters'
+            ).reindex(index=score_pivot.index, columns=score_pivot.columns)
+            modularity_pivot = grid_df.pivot(
+                index='n_components', columns='k', values='modularity'
+            ).reindex(index=score_pivot.index, columns=score_pivot.columns)
+            stability_pivot = grid_df.pivot(
+                index='n_components', columns='k', values='stability'
+            ).reindex(index=score_pivot.index, columns=score_pivot.columns)
+            selected_rows = grid_df[grid_df['selected']]
+            selected_components = None
+            selected_k = None
+            if not selected_rows.empty:
+                selected_components = int(selected_rows.iloc[0]['n_components'])
+                selected_k = int(selected_rows.iloc[0]['k'])
+
+            hover_text = []
+            for component_count in score_pivot.index:
+                row_text = []
+                for k_value in score_pivot.columns:
+                    score = score_pivot.loc[component_count, k_value]
+                    cluster_count = cluster_pivot.loc[component_count, k_value]
+                    modularity = modularity_pivot.loc[component_count, k_value]
+                    stability = stability_pivot.loc[component_count, k_value]
+                    if pd.isna(score):
+                        row_text.append("No candidate evaluated")
+                    else:
+                        row_text.append(
+                            f"Components: {component_count}<br>k: {k_value}<br>"
+                            f"Avg intra-Jaccard: {score:.4f}<br>"
+                            f"Clusters: {int(cluster_count)}<br>"
+                            f"Modularity: {modularity:.4f}<br>"
+                            f"Stability: {stability:.4f}"
+                        )
+                hover_text.append(row_text)
+
+            fig = go.Figure(go.Heatmap(
+                x=score_pivot.columns.tolist(),
+                y=score_pivot.index.tolist(),
+                z=score_pivot.to_numpy(),
+                text=hover_text,
+                hovertemplate='%{text}<extra></extra>',
+                colorscale='RdYlGn_r',
+                colorbar=dict(title='Avg intra-<br>Jaccard<br>distance'),
+                connectgaps=False
+            ))
+            if selected_components is not None and selected_k is not None:
+                fig.add_trace(go.Scatter(
+                    x=[selected_k],
+                    y=[selected_components],
+                    mode='markers',
+                    marker=dict(
+                        symbol='square-open', size=18,
+                        color='black', line=dict(width=2)
+                    ),
+                    name='Selected candidate',
+                    hovertemplate=(
+                        f'Selected: components={selected_components}, k={selected_k}'
+                        '<extra></extra>'
+                    )
+                ))
+            fig.update_layout(
+                title='SVD Component / SNN k Grid Search<br><sub>Lower average intracluster Jaccard distance is better</sub>',
+                xaxis_title='SNN neighborhood size (k)',
+                yaxis_title='SVD components',
+                height=550,
+                template='plotly',
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                margin=dict(l=80, r=30, t=90, b=70)
+            )
+            return ui.HTML(fig.to_html(
+                full_html=False,
+                include_plotlyjs='require',
+                div_id='svd_grid_search_heatmap'
+            ))
+        except Exception as error:
+            return ui.HTML(f"<pre style='color: red;'>Grid search heatmap error: {error}</pre>")
+
+    @output
+    @render.ui
+    def svd_cluster_elbow_plot():
+        _ = cluster_refresh_tick.get()
+        elbow_df = getattr(clust, 'svd_cluster_elbow_data', None) if clust is not None else None
+        if elbow_df is None or elbow_df.empty:
+            return ui.p("At least three models are needed for the cluster-count elbow plot.", style="padding: 10px; color: #999;")
+        try:
+            import plotly.graph_objects as go
+            fig = go.Figure(go.Scatter(
+                x=elbow_df['n_clusters'],
+                y=elbow_df['wcss_per_point'],
+                mode='lines+markers',
+                name='KMeans WCSS',
+                customdata=elbow_df['wcss'],
+                hovertemplate=(
+                    'Clusters: %{x}<br>WCSS per datapoint: %{y:.4f}'
+                    '<br>Raw WCSS: %{customdata:.2f}<extra></extra>'
+                )
+            ))
+            selected_rows = elbow_df[elbow_df['selected']]
+            if not selected_rows.empty:
+                selected_row = selected_rows.iloc[0]
+                fig.add_vline(x=int(selected_row['n_clusters']), line_dash='dash', line_color='red')
+                fig.add_annotation(
+                    x=int(selected_row['n_clusters']),
+                    y=float(selected_row['wcss_per_point']),
+                    text=f"Leiden result: {int(selected_row['n_clusters'])} clusters",
+                    showarrow=True
+                )
+            fig.update_layout(
+                title='Cluster-Count Elbow: Number of Clusters vs WCSS',
+                xaxis_title='Number of clusters',
+                yaxis_title='WCSS per datapoint',
+                height=350,
+                template='plotly',
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)'
+            )
+            return ui.HTML(fig.to_html(full_html=False, include_plotlyjs='require', div_id='svd_cluster_elbow'))
+        except Exception as error:
+            return ui.HTML(f"<pre style='color: red;'>Cluster elbow plot error: {error}</pre>")
+
+    @output
+    @render.data_frame
+    def svd_loadings_table():
+        _ = cluster_refresh_tick.get()
+        loading_df = svd_loadings.get()
+        if loading_df is None or loading_df.empty:
+            return pd.DataFrame()
+        return render.DataGrid(loading_df, width="100%", height=450, filters=True)
+
+    @output
+    @render.data_frame
+    def svd_isolated_points_table():
+        _ = cluster_refresh_tick.get()
+        isolated_df = svd_isolated_points.get()
+        if isolated_df is None:
+            return pd.DataFrame()
+        return render.DataGrid(isolated_df, width="100%", height=250, filters=True)
+
+    @output
+    @render.data_frame
+    def svd_model_coordinates_table():
+        _ = cluster_refresh_tick.get()
+        coordinates_df = svd_model_coordinates.get()
+        if coordinates_df is None or coordinates_df.empty:
+            return pd.DataFrame()
+        return render.DataGrid(coordinates_df, width="100%", height=450, filters=True)
     
     @output
     @render.ui
@@ -2799,10 +3191,19 @@ def server(input, output, session):
         
         try:
             method = input.scatter_method()
-            # print(f"\n=== Creating {method.upper()} scatter plot ===")
-            
-            # Use Jaccard matrix for visualization
-            fig = create_scatter_multimethod(stats_df, clust.jaccard_distance_matrix, method=method)
+            feature_matrix = None
+            visualization_matrix = clust.jaccard_distance_matrix
+            if getattr(clust, 'clustering_input_mode', None) == 'svd_snn':
+                from sklearn.metrics import pairwise_distances
+                feature_matrix = clust.svd_coordinates
+                visualization_matrix = pairwise_distances(feature_matrix, metric='euclidean')
+
+            fig = create_scatter_multimethod(
+                stats_df,
+                visualization_matrix,
+                method=method,
+                feature_matrix=feature_matrix
+            )
             
             html = fig.to_html(full_html=False, include_plotlyjs='require', div_id='scatter_plot')
             wrapped_html = f'<div style="width: 100%; height: 600px;">{html}</div>'
