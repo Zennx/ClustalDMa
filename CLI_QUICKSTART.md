@@ -53,6 +53,22 @@ python clustal_cli.py \
   --n-jobs -1
 ```
 
+### SVD + SNN-Leiden
+```bash
+python clustal_cli.py \
+  -m models/ \
+  -o results_svd/ \
+  --clustering-method svd_leiden \
+  --svd-optimization-mode grid \
+  --svd-max-intra-jaccard 0.6 \
+  --svd-snn-epsilon 0 \
+  --n-jobs -1
+```
+
+For fixed values, use `--svd-optimization-mode manual` with
+`--svd-components` and `--svd-k`. The `one_dim` mode keeps the automatic SVD
+component choice and optimizes only the SNN neighborhood size.
+
 ---
 
 ## Required Arguments
@@ -97,6 +113,14 @@ All 6 models will be found and analyzed!
 | `--filter-duplicates` | False | Filter near-duplicate structures (RMSD < 0.5 Å) |
 | `--distance-cutoff` | 4.5 | Contact distance cutoff in Ångströms |
 | `--n-jobs` | -1 | Number of parallel jobs (-1 = all CPUs) |
+| `--clustering-method` | `hdbscan` | `hdbscan` or `svd_leiden` |
+| `--svd-optimization-mode` | `grid` | `grid`, `one_dim`, or `manual` |
+| `--svd-components` | 5 | Manual SVD component count |
+| `--svd-k` | 20 | Manual SNN neighborhood size |
+| `--svd-snn-epsilon` | 0 | SNN edge epsilon |
+| `--svd-prune-edges` | False | Remove weak SNN edges |
+| `--svd-min-shared-neighbors` | 1 | Minimum shared neighbors when pruning |
+| `--svd-max-intra-jaccard` | 0.6 | Maximum acceptable average intracluster Jaccard distance |
 
 **Compatibility note:** `--ligand-id` is still accepted as a deprecated fallback, but new workflows should use `--protein-chains`.
 
@@ -125,15 +149,23 @@ results/
 ├── index.html                      # ← Main summary report (open this first!)
 ├── html_reports/
 │   ├── dendrogram.html            # Hierarchical clustering
-│   ├── 3d_clusters.html           # Interactive 3D visualization
+│   ├── qc_summary.html             # Clustering QC views
+│   ├── dimensionality_reduction.html # MDS/t-SNE/PCA/UMAP views
 │   ├── jaccard_heatmap.html       # Similarity matrix
+│   ├── svd_elbow.html              # SVD component elbow (SVD mode)
+│   ├── svd_component_k_grid_search.html # SVD/k heatmap (SVD mode)
+│   ├── svd_cluster_count_wcss.html # Cluster-count WCSS elbow (SVD mode)
 │   ├── condensed_tree.html        # HDBSCAN cluster tree
-│   ├── sequence_alignment.html    # QC visualization
-│   └── contact_distance_*.html    # Contact pattern analysis
+│   ├── intra_cluster_heatmaps.html # Within-cluster validation
+│   ├── hotspots_overall.html       # Overall contact hotspots
+│   └── contact_hotspots_by_cluster.html # Cluster contact patterns
 ├── csv_exports/
 │   ├── cluster_summary.csv        # Cluster statistics
 │   ├── structure_assignments.csv   # Structure → cluster mapping
 │   ├── jaccard_matrix.csv         # Full similarity matrix
+│   ├── svd_elbow_curve.csv         # SVD elbow data (SVD mode)
+│   ├── svd_component_k_grid_search.csv # Grid search data (SVD mode)
+│   └── svd_cluster_count_wcss_curve.csv # WCSS elbow data (SVD mode)
 │   └── contact_exports/           # Per-structure contact lists
 │       ├── model1_contacts.csv
 │       ├── model2_contacts.csv

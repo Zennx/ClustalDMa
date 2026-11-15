@@ -7,6 +7,7 @@ from .interactive import (
     create_interactive_scatter,
     create_hotspot_histogram,
     create_molstar_viewer_html,  # Molstar viewer
+    create_molstar_superposition_html,
     create_scatter_multimethod,
     create_distance_heatmap,
     create_cluster_size_distribution,
@@ -16,6 +17,7 @@ __all__ = [
     'create_interactive_scatter',
     'create_hotspot_histogram', 
     'create_molstar_viewer_html',
+    'create_molstar_superposition_html',
     'create_scatter_multimethod',
     'create_distance_heatmap',
     'create_cluster_size_distribution',

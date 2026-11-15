@@ -114,6 +114,31 @@ Examples:
         action='store_true',
         help='Filter near-duplicate structures (RMSD < 0.5 Å)'
     )
+
+    parser.add_argument(
+        '--clustering-method',
+        choices=['hdbscan', 'svd_leiden'],
+        default='hdbscan',
+        help='Clustering method (default: hdbscan)'
+    )
+    parser.add_argument(
+        '--svd-optimization-mode',
+        choices=['grid', 'one_dim', 'manual'],
+        default='grid',
+        help='SVD + Leiden strategy: grid, one_dim, or manual (default: grid)'
+    )
+    parser.add_argument('--svd-components', type=int, default=5,
+                        help='Manual SVD component count (default: 5)')
+    parser.add_argument('--svd-k', type=int, default=20,
+                        help='Manual SNN neighborhood size (default: 20)')
+    parser.add_argument('--svd-snn-epsilon', type=float, default=0.0,
+                        help='SNN edge epsilon (default: 0)')
+    parser.add_argument('--svd-prune-edges', action='store_true',
+                        help='Prune weak SNN edges')
+    parser.add_argument('--svd-min-shared-neighbors', type=int, default=1,
+                        help='Minimum shared neighbors when pruning (default: 1)')
+    parser.add_argument('--svd-max-intra-jaccard', type=float, default=0.6,
+                        help='Maximum acceptable average intracluster Jaccard distance (default: 0.6)')
     
     parser.add_argument(
         '--distance-cutoff',
@@ -364,8 +389,50 @@ def create_multi_view_html(figures_dict, output_path, title, default_view=None):
     print(f"  ✓ Saved: {output_path.name} ({len(figures_dict)} views)")
 
 
-def generate_summary_html(output_dirs, params, cluster_summary, analysis_time):
-    """Generate main summary HTML page with links to all reports"""
+def generate_summary_html(
+    output_dirs, params, cluster_summary, analysis_time,
+    report_files=None, results=None
+):
+    """Generate an index containing only available reports and actual metadata."""
+    from html import escape
+
+    report_catalog = {
+        'html_reports/qc_summary.html': ('📊 Clustering QC Summary', 'Size, stability, and inter-cluster distances'),
+        'html_reports/dendrogram.html': ('🌲 Hierarchical Dendrogram', 'Full distance matrix with hierarchical clustering'),
+        'html_reports/dimensionality_reduction.html': ('🎯 Dimensionality Reduction', 'MDS, t-SNE, PCA, and UMAP projections'),
+        'html_reports/jaccard_heatmap.html': ('🔥 Jaccard Distance Heatmap', 'Structure-to-structure contact similarity'),
+        'html_reports/rmsd_heatmap.html': ('📏 RMSD Distance Heatmap', 'Structure-to-structure RMSD comparison'),
+        'html_reports/intra_cluster_heatmaps.html': ('📊 Intra-Cluster Heatmaps', 'Within-cluster distance validation'),
+        'html_reports/hotspots_overall.html': ('🔥 Overall Binding Hotspots', 'Contact residue frequencies'),
+        'html_reports/contact_hotspots_by_cluster.html': ('🔥 Binding Hotspots by Cluster', 'Contact patterns by cluster'),
+        'html_reports/condensed_tree.html': ('🌳 HDBSCAN Condensed Tree', 'Cluster formation hierarchy'),
+        'html_reports/svd_elbow.html': ('📉 SVD Component Elbow', 'Explained variance and selected dimensionality'),
+        'html_reports/svd_component_k_grid_search.html': ('🧭 SVD / SNN Grid Search', 'Component and neighborhood-size heatmap'),
+        'html_reports/svd_cluster_count_wcss.html': ('📈 Cluster-Count WCSS Elbow', 'WCSS per datapoint across cluster counts')
+    }
+    available_reports = set(report_files or [])
+    if not available_reports:
+        root = Path(output_dirs['html']).parent
+        available_reports = {
+            str(path.relative_to(root)) for path in root.rglob('*.html')
+            if path.name != 'index.html'
+        }
+    report_links = ''.join(
+        f'<a href="{path}" class="report-link"><h3>{report_catalog[path][0]}</h3>'
+        f'<p>{report_catalog[path][1]}</p></a>'
+        for path in report_catalog if path in available_reports
+    ) or '<p>No interactive reports were generated.</p>'
+    parameter_items = ''.join(
+        f'<div class="param-item"><div class="param-label">{escape(str(label))}</div>'
+        f'<div class="param-value">{escape(str(value))}</div></div>'
+        for label, value in params.items()
+    )
+    result_items = ''
+    for label, value in (results or {}).items():
+        result_items += (
+            f'<div class="param-item"><div class="param-label">{escape(str(label))}</div>'
+            f'<div class="param-value">{escape(str(value))}</div></div>'
+        )
     html_content = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -481,53 +548,14 @@ def generate_summary_html(output_dirs, params, cluster_summary, analysis_time):
     <div class="card">
         <h2>Analysis Parameters</h2>
         <div class="param-grid">
-            <div class="param-item">
-                <div class="param-label">Models Directory</div>
-                <div class="param-value">{params['models']}</div>
-            </div>
-            <div class="param-item">
-                <div class="param-label">Total Structures</div>
-                <div class="param-value">{params['n_structures']}</div>
-            </div>
-            <div class="param-item">
-                <div class="param-label">Protein Chain(s)</div>
-                <div class="param-value">{params['protein_chains']}</div>
-            </div>
-            <div class="param-item">
-                <div class="param-label">Distance Cutoff</div>
-                <div class="param-value">{params['distance_cutoff']} Å</div>
-            </div>
-            <div class="param-item">
-                <div class="param-label">Min Cluster Size</div>
-                <div class="param-value">{params['min_cluster_size']}</div>
-            </div>
-            <div class="param-item">
-                <div class="param-label">Min Samples</div>
-                <div class="param-value">{params['min_samples']}</div>
-            </div>
-            <div class="param-item">
-                <div class="param-label">HDBSCAN Epsilon</div>
-                <div class="param-value">{params['hdbscan_epsilon']}</div>
-            </div>
-            <div class="param-item">
-                <div class="param-label">HDBSCAN Method</div>
-                <div class="param-value">{params['hdbscan_selection_method']}</div>
-            </div>
-            <div class="param-item">
-                <div class="param-label">Apply Residue Offset</div>
-                <div class="param-value">{'Yes' if params['apply_offset'] else 'No'}</div>
-            </div>
-            <div class="param-item">
-                <div class="param-label">Filter Duplicates</div>
-                <div class="param-value">{'Yes' if params['filter_duplicates'] else 'No'}</div>
-            </div>
-            <div class="param-item">
-                <div class="param-label">Analysis Time</div>
-                <div class="param-value">{analysis_time:.1f} seconds</div>
-            </div>
+            {parameter_items}
+            <div class="param-item"><div class="param-label">Analysis Time</div>
+                <div class="param-value">{analysis_time:.1f} seconds</div></div>
         </div>
     </div>
     
+    {f'<div class="card"><h2>Run Results</h2><div class="param-grid">{result_items}</div></div>' if result_items else ''}
+
     <div class="card">
         <h2>Cluster Summary</h2>
         <table class="cluster-table">
@@ -544,7 +572,7 @@ def generate_summary_html(output_dirs, params, cluster_summary, analysis_time):
     
     # Add cluster rows
     for _, row in cluster_summary.iterrows():
-        if row['cluster'] != -1:
+        if row['cluster'] != -1 and row['cluster'] != 'Noise':
             html_content += f"""
                 <tr>
                     <td><strong>Cluster {row['cluster']}</strong></td>
@@ -554,51 +582,16 @@ def generate_summary_html(output_dirs, params, cluster_summary, analysis_time):
                 </tr>
 """
     
-    html_content += """
+    html_content += f"""
             </tbody>
         </table>
     </div>
     
     <div class="card">
         <h2>Interactive Reports</h2>
-        <p>Click on any report to view interactive visualizations with dropdown menus:</p>
+        <p>Open a generated report below:</p>
         <div class="report-links">
-            <a href="html_reports/qc_summary.html" class="report-link" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">
-                <h3>📊 Clustering QC Summary</h3>
-                <p>Size distribution, stability, inter-cluster distances</p>
-            </a>
-            <a href="html_reports/dendrogram.html" class="report-link">
-                <h3>🌲 Hierarchical Dendrogram</h3>
-                <p>Full distance matrix with hierarchical clustering</p>
-            </a>
-            <a href="html_reports/dimensionality_reduction.html" class="report-link">
-                <h3>🎯 Dimensionality Reduction</h3>
-                <p>MDS, t-SNE, PCA, UMAP projections (dropdown menu)</p>
-            </a>
-            <a href="html_reports/jaccard_heatmap.html" class="report-link">
-                <h3>🔥 Jaccard Distance Heatmap</h3>
-                <p>Structure-to-structure similarity matrix</p>
-            </a>
-            <a href="html_reports/intra_cluster_heatmaps.html" class="report-link">
-                <h3>📊 Intra-Cluster Heatmaps</h3>
-                <p>Within-cluster distances (dropdown per cluster)</p>
-            </a>
-            <a href="html_reports/hotspots_overall.html" class="report-link">
-                <h3>🔥 Overall Binding Hotspots</h3>
-                <p>Contact residue frequencies across ALL structures</p>
-            </a>
-            <a href="html_reports/contact_hotspots_by_cluster.html" class="report-link">
-                <h3>🔥 Binding Hotspots by Cluster</h3>
-                <p>Contact residue patterns per cluster (dropdown menu)</p>
-            </a>
-            <a href="html_reports/condensed_tree.html" class="report-link">
-                <h3>🌳 HDBSCAN Condensed Tree</h3>
-                <p>Cluster formation hierarchy visualization</p>
-            </a>
-            <a href="html_reports/sequence_alignment.html" class="report-link">
-                <h3>🧬 Sequence Alignment QC</h3>
-                <p>Secondary structure and pLDDT confidence</p>
-            </a>
+            {report_links}
         </div>
     </div>
     
@@ -609,7 +602,7 @@ def generate_summary_html(output_dirs, params, cluster_summary, analysis_time):
             <li><code>csv_exports/cluster_summary.csv</code> - Cluster statistics</li>
             <li><code>csv_exports/structure_assignments.csv</code> - Structure-to-cluster mapping</li>
             <li><code>csv_exports/jaccard_matrix.csv</code> - Full similarity matrix</li>
-            <li><code>csv_exports/contact_exports/</code> - Per-structure contact lists</li>
+            <li><code>csv_exports/contact_exports/contact_statistics.csv</code> - Concatenated contact statistics</li>
         </ul>
         
         <h3>Representative Structures</h3>
@@ -700,13 +693,21 @@ def main():
     
     # Run analysis
     print(f"\n🚀 Starting analysis pipeline...")
-    print(
-        "   HDBSCAN parameters: "
-        f"min_cluster_size={args.min_cluster_size}, "
-        f"min_samples={args.min_samples}, "
-        f"epsilon={args.hdbscan_epsilon}, "
-        f"method={args.hdbscan_selection_method}"
-    )
+    if args.clustering_method == 'svd_leiden':
+        print(
+            "   SVD + SNN-Leiden parameters: "
+            f"strategy={args.svd_optimization_mode}, "
+            f"components={args.svd_components}, k={args.svd_k}, "
+            f"epsilon={args.svd_snn_epsilon}, prune={args.svd_prune_edges}"
+        )
+    else:
+        print(
+            "   HDBSCAN parameters: "
+            f"min_cluster_size={args.min_cluster_size}, "
+            f"min_samples={args.min_samples}, "
+            f"epsilon={args.hdbscan_epsilon}, "
+            f"method={args.hdbscan_selection_method}"
+        )
     print(f"   Protein chains: {args.protein_chains}")
     print(f"   This may take several minutes for large datasets...")
     
@@ -757,14 +758,41 @@ def main():
             n_jobs=args.n_jobs
         )
         
-        # Perform HDBSCAN clustering
-        clusterer.cluster_hdbscan(
-            min_cluster_size=args.min_cluster_size,
-            min_samples=args.min_samples,
-            filter_duplicates=args.filter_duplicates,
-            cluster_selection_epsilon=args.hdbscan_epsilon,
-            cluster_selection_method=args.hdbscan_selection_method
-        )
+        if args.clustering_method == 'svd_leiden':
+            if args.svd_optimization_mode == 'manual':
+                svd_components = args.svd_components
+                svd_k = args.svd_k
+                optimize_grid = False
+                optimize_k = False
+            elif args.svd_optimization_mode == 'one_dim':
+                svd_components = 'auto'
+                svd_k = 'auto'
+                optimize_grid = False
+                optimize_k = True
+            else:
+                svd_components = 'auto'
+                svd_k = 'auto'
+                optimize_grid = True
+                optimize_k = False
+
+            clusterer.cluster_svd_leiden(
+                n_components=svd_components,
+                n_neighbors=svd_k,
+                snn_epsilon=args.svd_snn_epsilon,
+                prune_edges=args.svd_prune_edges,
+                min_shared_neighbors=args.svd_min_shared_neighbors,
+                optimize_grid=optimize_grid,
+                optimize_k=optimize_k,
+                max_average_intra_jaccard=args.svd_max_intra_jaccard
+            )
+        else:
+            clusterer.cluster_hdbscan(
+                min_cluster_size=args.min_cluster_size,
+                min_samples=args.min_samples,
+                filter_duplicates=args.filter_duplicates,
+                cluster_selection_epsilon=args.hdbscan_epsilon,
+                cluster_selection_method=args.hdbscan_selection_method
+            )
         
         analysis_time = time.time() - start_time
         print(f"\n✅ Analysis complete in {analysis_time:.1f} seconds")
@@ -773,8 +801,12 @@ def main():
         results = {
             'labels': clusterer.labels,
             'probabilities': getattr(clusterer, 'probabilities', None),
-            'jaccard_matrix': clusterer.jaccard_distance_matrix
+            'jaccard_matrix': clusterer.jaccard_distance_matrix,
+            'clustering_method': args.clustering_method,
+            'svd_components': getattr(clusterer, 'svd_optimized_components', None),
+            'svd_k': getattr(clusterer, 'svd_optimized_k', None)
         }
+        pdb_files = list(clusterer.pdb_files)
         
     except Exception as e:
         print(f"\n❌ ERROR during analysis: {e}")
@@ -784,6 +816,13 @@ def main():
     
     # Get cluster summary
     cluster_summary = clusterer.get_cluster_summary()
+    cluster_summary_report = cluster_summary.copy()
+    if 'cluster' in cluster_summary_report.columns:
+        cluster_summary_report['cluster'] = cluster_summary_report['cluster'].map(
+            lambda value: int(value) + 1 if int(value) >= 0 else 'Noise'
+        )
+    if 'binding_mode' in cluster_summary_report.columns:
+        cluster_summary_report['binding_mode'] = cluster_summary_report['binding_mode'].astype(str)
     
     print(f"\n📊 Clustering Results:")
     print(f"   Total clusters: {len(cluster_summary[cluster_summary['cluster'] != -1])}")
@@ -793,7 +832,7 @@ def main():
     
     # Save cluster summary CSV
     csv_path = output_dirs['csv'] / 'cluster_summary.csv'
-    cluster_summary.to_csv(csv_path, index=False)
+    cluster_summary_report.to_csv(csv_path, index=False)
     print(f"\n💾 Saved cluster summary: {csv_path.name}")
     
     # Save structure assignments
@@ -809,12 +848,13 @@ def main():
     if probs is None or len(probs) != len(labels):
        probs = [1.0] * len(labels)
 
-    structures = structures[:len(labels)]
+    print(f"pdb_files length: {len(pdb_files)}")
+    print(f"results['labels'] length: {len(results['labels'])}")
 
     assignments_df = pd.DataFrame({
-        'structure': [os.path.basename(str(f)) for f in pdb_files],
-        'cluster': results['labels'],
-        'probability': results.get('probabilities', [1.0] * len(pdb_files))
+        'structure': structures,
+        'cluster': [int(label) + 1 if int(label) >= 0 else 'Noise' for label in labels],
+        'probabilities': probs
     })
     assignments_path = output_dirs['csv'] / 'structure_assignments.csv'
     assignments_df.to_csv(assignments_path, index=False)
@@ -892,6 +932,16 @@ def main():
         print(f"     ⚠️ Warning: Could not generate heatmap: {e}")
         import traceback
         traceback.print_exc()
+
+    # 3b. SVD + SNN-Leiden diagnostics
+    if args.clustering_method == 'svd_leiden':
+        print("   • SVD + SNN-Leiden diagnostic curves...")
+        try:
+            from core.reporting import write_svd_diagnostics
+            written = write_svd_diagnostics(clusterer, output_dirs['html'].parent)
+            print(f"     ✓ Wrote {len(written)} SVD diagnostic files")
+        except Exception as e:
+            print(f"     ⚠️ Warning: Could not generate SVD diagnostics: {e}")
     
     # 4. Condensed tree
     print("   • HDBSCAN Condensed Tree...")
@@ -1188,35 +1238,18 @@ def main():
         import traceback
         traceback.print_exc()
     
-    # 8. Sequence alignment QC
-    if reference_sequence:
-        print("   • Sequence Alignment QC...")
-        try:
-            from visualization.sequence_alignment import create_alignment_visualization_medoids
-            fig_align = create_alignment_visualization_medoids(
-                pdb_files=[str(f) for f in pdb_files],
-                labels=results['labels'],
-                reference_pdb=reference_pdb,
-                reference_sequence=reference_sequence,
-                cluster_summary=cluster_summary
-            )
-            save_html_report(fig_align, output_dirs['html'] / 'sequence_alignment.html', 'Sequence Alignment')
-        except Exception as e:
-            print(f"     ⚠️ Warning: Could not generate sequence alignment: {e}")
-    
     # Export contact lists
     print(f"\n💾 Exporting contact lists...")
     contact_export_dir = output_dirs['csv'] / 'contact_exports'
-    contact_export_dir.mkdir(exist_ok=True)
-    
-    if hasattr(clusterer, 'contact_sets_'):
-        for i, (pdb_file, contacts) in enumerate(zip(pdb_files, clusterer.contact_lists_)):
-            if len(contacts) > 0:
-                basename = os.path.basename(str(pdb_file)).replace('.pdb', '')
-                contact_df = pd.DataFrame(contacts)
-                contact_path = contact_export_dir / f'{basename}_contacts.csv'
-                contact_df.to_csv(contact_path, index=False)
-        print(f"   Exported {len(clusterer.contact_lists_)} contact lists")
+    contact_export_dir.mkdir(parents=True, exist_ok=True)
+
+    contact_statistics = clusterer.get_interface_stats()
+    contact_statistics['cluster'] = contact_statistics['cluster'].map(
+        lambda value: int(value) + 1 if int(value) >= 0 else 'Noise'
+    )
+    contact_statistics_path = contact_export_dir / 'contact_statistics.csv'
+    contact_statistics.to_csv(contact_statistics_path, index=False)
+    print(f"   Exported contact statistics for {len(contact_statistics)} structures")
     
     # Copy representative structures
     print(f"\n📦 Copying cluster representatives...")
@@ -1239,6 +1272,7 @@ def main():
         {
             'models': args.models,
             'n_structures': len(pdb_files),
+            'clustering_method': args.clustering_method,
             'protein_chains': protein_chain_report_value,
             'distance_cutoff': args.distance_cutoff,
             'min_cluster_size': args.min_cluster_size,
@@ -1246,10 +1280,23 @@ def main():
             'hdbscan_epsilon': args.hdbscan_epsilon,
             'hdbscan_selection_method': args.hdbscan_selection_method,
             'apply_offset': args.apply_offset,
-            'filter_duplicates': args.filter_duplicates
+            'filter_duplicates': args.filter_duplicates,
+            'svd_optimization_mode': args.svd_optimization_mode,
+            'svd_components_input': args.svd_components,
+            'svd_k_input': args.svd_k,
+            'svd_snn_epsilon': args.svd_snn_epsilon,
+            'svd_prune_edges': args.svd_prune_edges,
+            'svd_min_shared_neighbors': args.svd_min_shared_neighbors,
+            'svd_max_intra_jaccard': args.svd_max_intra_jaccard
         },
-        cluster_summary,
-        analysis_time
+        cluster_summary_report,
+        analysis_time,
+        results={
+            'Contacting Structures': int(sum(1 for label in results['labels'] if label != -1)),
+            'Noise Points': int(sum(1 for label in results['labels'] if label == -1)),
+            'Selected SVD Components': results.get('svd_components'),
+            'Selected SNN k': results.get('svd_k')
+        }
     )
     
     print("\n" + "=" * 80)

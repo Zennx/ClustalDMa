@@ -16,6 +16,11 @@ import plotly.figure_factory as ff
 from sklearn.decomposition import PCA
 from sklearn.manifold import MDS, TSNE
 
+
+def _display_cluster_id(cluster_id):
+    """Convert internal zero-based cluster IDs for display only."""
+    return int(cluster_id) + 1 if int(cluster_id) >= 0 else "Noise"
+
 def create_interactive_scatter(df, distance_matrix):
     """
     Create interactive scatter plot with structure preview on hover
@@ -49,7 +54,7 @@ def create_interactive_scatter(df, distance_matrix):
     hover_text = []
     for idx, row in df.iterrows():
         text = f"<b>{row['structure']}</b><br>"
-        text += f"Cluster: {row['cluster']}<br>"
+        text += f"Cluster: {_display_cluster_id(row['cluster'])}<br>"
         text += f"Protein residues: {row['n_protein_residues']}<br>"
         if len(row['protein_residues']) > 50:
             text += f"Interface: {row['protein_residues'][:47]}..."
@@ -485,6 +490,158 @@ def create_molstar_viewer_html(pdb_file, width=800, height=600,
     return html_template
 
 
+def create_molstar_superposition_html(pdb_files, structure_labels=None, width=900, height=650):
+    """Create a Molstar viewer with selected structures aligned and overlaid."""
+    import base64
+    import json
+    import os
+    import tempfile
+    import uuid
+
+    if not pdb_files:
+        raise ValueError("At least one structure is required for superposition.")
+    if structure_labels is None:
+        structure_labels = [os.path.basename(path) for path in pdb_files]
+    if len(structure_labels) != len(pdb_files):
+        raise ValueError("structure_labels must match pdb_files in length.")
+
+    colors = [
+        ('#e45756', 0xe45756), ('#4c78a8', 0x4c78a8),
+        ('#59a14f', 0x59a14f), ('#f28e2b', 0xf28e2b),
+        ('#b279a2', 0xb279a2), ('#76b7b2', 0x76b7b2),
+        ('#edc949', 0xedc949), ('#af7aa1', 0xaf7aa1),
+        ('#ff9da7', 0xff9da7), ('#9c755f', 0x9c755f)
+    ]
+    aligned_paths = []
+    try:
+        from MDAnalysis.analysis import align
+        from core.clusterer import load_universe_with_cif_support
+
+        reference = load_universe_with_cif_support(pdb_files[0])
+        for index, pdb_file in enumerate(pdb_files):
+            universe = load_universe_with_cif_support(pdb_file)
+            if index > 0:
+                align.AlignTraj(
+                    universe,
+                    reference,
+                    select='protein and name CA',
+                    in_memory=True
+                ).run()
+            temp_file = tempfile.NamedTemporaryFile(
+                suffix='.pdb', delete=False
+            )
+            temp_file.close()
+            universe.atoms.write(temp_file.name)
+            aligned_paths.append(temp_file.name)
+
+        structures = []
+        for index, (pdb_file, aligned_path) in enumerate(zip(pdb_files, aligned_paths)):
+            with open(aligned_path, 'r') as handle:
+                encoded = base64.b64encode(handle.read().encode()).decode()
+            structures.append({
+                'name': structure_labels[index],
+                'data': encoded,
+                'css_color': colors[index % len(colors)][0],
+                'color': colors[index % len(colors)][1]
+            })
+    except Exception as alignment_error:
+        print(f"Warning: Could not align selected structures; loading originals: {alignment_error}")
+        structures = []
+        for index, pdb_file in enumerate(pdb_files):
+            with open(pdb_file, 'r') as handle:
+                encoded = base64.b64encode(handle.read().encode()).decode()
+            structures.append({
+                'name': structure_labels[index],
+                'data': encoded,
+                'css_color': colors[index % len(colors)][0],
+                'color': colors[index % len(colors)][1]
+            })
+    finally:
+        for aligned_path in aligned_paths:
+            try:
+                os.unlink(aligned_path)
+            except OSError:
+                pass
+
+    structures_json = json.dumps(structures)
+    container_id = f"molstar-superposition-{uuid.uuid4().hex}"
+    script_token = uuid.uuid4().hex
+    wait_function = f"waitForMolstar_{script_token}"
+    start_function = f"startSuperposition_{script_token}"
+    legend_items = ''.join(
+        f'<span style="display:inline-flex;align-items:center;margin-right:14px;">'
+        f'<span style="width:12px;height:12px;background:{item["css_color"]};'
+        f'display:inline-block;margin-right:5px;border:1px solid #555;"></span>'
+        f'{item["name"]}</span>'
+        for item in structures
+    )
+    html_template = f'''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/molstar@latest/build/viewer/molstar.css" />
+    <style>
+        #{container_id} {{ position: relative; width: {width}px; height: {height}px; margin: 0 auto; }}
+        #superposition-legend {{ width: {width}px; margin: 0 auto 8px; font: 13px sans-serif; }}
+    </style>
+</head>
+<body>
+    <div id="superposition-legend">{legend_items}</div>
+    <div id="{container_id}"></div>
+    <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/molstar@latest/build/viewer/molstar.js"></script>
+    <script>
+        var selectedStructures = {structures_json};
+        function {wait_function}() {{
+            if (typeof molstar === 'undefined') {{
+                setTimeout({wait_function}, 100);
+                return;
+            }}
+            {start_function}();
+        }}
+        async function {start_function}() {{
+            const wrapper = await molstar.Viewer.create(
+                document.getElementById('{container_id}'),
+                {{ layoutIsExpanded: false, layoutShowControls: false,
+                   layoutShowRemoteState: false, layoutShowSequence: true,
+                   layoutShowLog: false, layoutShowLeftPanel: false,
+                   viewportShowExpand: true }}
+            );
+            const plugin = wrapper.plugin;
+            for (const item of selectedStructures) {{
+                const data = await plugin.builders.data.rawData({{
+                    data: atob(item.data), label: item.name
+                }});
+                const trajectory = await plugin.builders.structure.parseTrajectory(data, 'pdb');
+                const model = await plugin.builders.structure.createModel(trajectory);
+                const structure = await plugin.builders.structure.createStructure(model);
+                const protein = await plugin.builders.structure.tryCreateComponentStatic(structure, 'protein');
+                if (protein) {{
+                    await plugin.builders.structure.representation.addRepresentation(protein, {{
+                        type: 'cartoon', typeParams: {{}}, color: 'uniform',
+                        colorParams: {{ value: item.color }}
+                    }});
+                }}
+                const nucleic = await plugin.builders.structure.tryCreateComponentStatic(structure, 'nucleic');
+                if (nucleic) {{
+                    await plugin.builders.structure.representation.addRepresentation(nucleic, {{
+                        type: 'ball-and-stick', typeParams: {{ sizeFactor: 0.3 }},
+                        color: 'uniform', colorParams: {{ value: item.color }}
+                    }});
+                }}
+            }}
+            plugin.canvas3d.requestCameraReset();
+        }}
+        if (document.readyState === 'loading') {{
+            document.addEventListener('DOMContentLoaded', {wait_function});
+        }} else {{ {wait_function}(); }}
+    </script>
+</body>
+</html>
+'''
+    return html_template
+
+
 def create_scatter_multimethod(df, distance_matrix, method='mds', feature_matrix=None):
     """
     Create interactive scatter plot with multiple dimensionality reduction methods
@@ -554,7 +711,7 @@ def create_scatter_multimethod(df, distance_matrix, method='mds', feature_matrix
     hover_text = []
     for idx, row in df.iterrows():
         text = f"<b>{row['structure']}</b><br>"
-        text += f"Cluster: {row['cluster']}<br>"
+        text += f"Cluster: {_display_cluster_id(row['cluster'])}<br>"
         text += f"Protein residues: {row['n_protein_residues']}<br>"
         if len(row['protein_residues']) > 50:
             text += f"Interface: {row['protein_residues'][:47]}..."
@@ -584,7 +741,7 @@ def create_scatter_multimethod(df, distance_matrix, method='mds', feature_matrix
         cluster_coords = coords_2d[mask]
         cluster_hover = [h for h, m in zip(hover_text, mask) if m]
         
-        label = f"Cluster {cluster_id}" if cluster_id != -1 else "Noise"
+        label = f"Cluster {_display_cluster_id(cluster_id)}" if cluster_id != -1 else "Noise"
         
         if is_3d:
             fig.add_trace(go.Scatter3d(
@@ -783,8 +940,8 @@ def create_distance_heatmap(distance_matrix, labels, metric_name='Distance'):
         row_text = []
         for j in range(len(sorted_labels)):
             row_text.append(
-                f"Structure {i} (Cluster {sorted_labels[i]}) vs<br>"
-                f"Structure {j} (Cluster {sorted_labels[j]})<br>"
+                f"Structure {i} (Cluster {_display_cluster_id(sorted_labels[i])}) vs<br>"
+                f"Structure {j} (Cluster {_display_cluster_id(sorted_labels[j])})<br>"
                 f"{metric_name}: {sorted_matrix[i,j]:.3f}"
             )
         hover_text.append(row_text)
@@ -839,19 +996,19 @@ def create_cluster_distance_heatmap(cluster_matrix, cluster_ids, cluster_sizes, 
         for j, cluster_j in enumerate(cluster_ids):
             if i == j:
                 row_text.append(
-                    f"Cluster {cluster_i} (n={cluster_sizes[cluster_i]})<br>"
+                    f"Cluster {_display_cluster_id(cluster_i)} (n={cluster_sizes[cluster_i]})<br>"
                     f"Intra-cluster avg {metric_name}: {cluster_matrix[i,j]:.3f}"
                 )
             else:
                 row_text.append(
-                    f"Cluster {cluster_i} (n={cluster_sizes[cluster_i]}) vs<br>"
-                    f"Cluster {cluster_j} (n={cluster_sizes[cluster_j]})<br>"
+                    f"Cluster {_display_cluster_id(cluster_i)} (n={cluster_sizes[cluster_i]}) vs<br>"
+                    f"Cluster {_display_cluster_id(cluster_j)} (n={cluster_sizes[cluster_j]})<br>"
                     f"Inter-cluster avg {metric_name}: {cluster_matrix[i,j]:.3f}"
                 )
         hover_text.append(row_text)
     
     # Create custom tick labels with cluster sizes
-    tick_labels = [f"C{cid}<br>(n={cluster_sizes[cid]})" for cid in cluster_ids]
+    tick_labels = [f"C{_display_cluster_id(cid)}<br>(n={cluster_sizes[cid]})" for cid in cluster_ids]
     n_clusters = len(cluster_ids)
     
     fig = go.Figure(data=go.Heatmap(
@@ -918,7 +1075,7 @@ def create_intra_cluster_heatmaps(intra_matrices, cluster_members, pdb_files, me
         
         fig = make_subplots(
             rows=rows, cols=cols,
-            subplot_titles=[f"Cluster {cid} (n={len(cluster_members[cid])})" for cid in cluster_ids],
+            subplot_titles=[f"Cluster {_display_cluster_id(cid)} (n={len(cluster_members[cid])})" for cid in cluster_ids],
             vertical_spacing=0.12,
             horizontal_spacing=0.08
         )
@@ -965,7 +1122,7 @@ def create_intra_cluster_heatmaps(intra_matrices, cluster_members, pdb_files, me
     else:
         # Too many clusters - return message to select specific cluster
         fig = go.Figure()
-        cluster_stats = "<br>".join([f"Cluster {cid}: {len(cluster_members[cid])} members, "
+        cluster_stats = "<br>".join([f"Cluster {_display_cluster_id(cid)}: {len(cluster_members[cid])} members, "
                                      f"avg intra-distance = {intra_matrices[cid].mean():.3f}"
                                      for cid in cluster_ids[:20]])  # Show first 20
         
@@ -1184,7 +1341,7 @@ def create_cluster_size_distribution(labels, duplicate_groups=None, rescued_clus
     # Create labels with asterisks
     labels_text = []
     for idx in cluster_counts.index:
-        label = f"Cluster {idx}"
+        label = f"Cluster {_display_cluster_id(idx)}"
         if rescued_cluster_ids and idx in rescued_cluster_ids:
             label += "**"  # Rescued (all duplicates)
         elif idx in clusters_with_duplicates:
@@ -1485,7 +1642,7 @@ def create_cluster_stability_plot(clusterer, labels, distance_matrix=None, dupli
     # Create x-axis labels with asterisks for clusters containing duplicates
     x_labels = []
     for cid in sorted_clusters:
-        label = f"Cluster {cid}"
+        label = f"Cluster {_display_cluster_id(cid)}"
         if rescued_cluster_ids and cid in rescued_cluster_ids:
             label += "**"  # Double asterisk for rescued (all duplicates)
         elif cid in clusters_with_duplicates:
@@ -1638,7 +1795,7 @@ def create_cluster_diversity_plot(labels, rmsd_matrix, pdb_files, sasa_data=None
             
             plot_data.append({
                 'cluster': cluster_id,
-                'cluster_label': f"Cluster {cluster_id} (n={cluster_sizes[cluster_id]})",
+                'cluster_label': f"Cluster {_display_cluster_id(cluster_id)} (n={cluster_sizes[cluster_id]})",
                 'rmsd': rmsd_from_medoid,
                 'structure': os.path.basename(pdb_files[global_idx]),
                 'delta_sasa': color_value,
@@ -1753,7 +1910,7 @@ def create_cluster_diversity_plot(labels, rmsd_matrix, pdb_files, sasa_data=None
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
         xaxis=dict(zerolinecolor='#808080', gridcolor='#e0e0e0'),
-        yaxis=dict(zerolinecolor='#808080', gridcolor='#e0e0e0', categoryorder='array', categoryarray=[f"Cluster {cid} (n={cluster_sizes[cid]})" for cid in sorted_clusters]),
+        yaxis=dict(zerolinecolor='#808080', gridcolor='#e0e0e0', categoryorder='array', categoryarray=[f"Cluster {_display_cluster_id(cid)} (n={cluster_sizes[cid]})" for cid in sorted_clusters]),
         hovermode='closest',
         margin=dict(l=120, r=20, t=60, b=60)  # Tighter margins
     )
@@ -1788,7 +1945,7 @@ def create_single_intra_cluster_heatmap(distance_matrix, labels, cluster_id, pdb
     if len(members) == 0:
         fig = go.Figure()
         fig.add_annotation(
-            text=f"Cluster {cluster_id} has no members",
+            text=f"Cluster {_display_cluster_id(cluster_id)} has no members",
             xref="paper", yref="paper",
             x=0.5, y=0.5, showarrow=False,
             font=dict(size=14, color="gray")
@@ -1799,7 +1956,7 @@ def create_single_intra_cluster_heatmap(distance_matrix, labels, cluster_id, pdb
     if len(members) == 1:
         fig = go.Figure()
         fig.add_annotation(
-            text=f"Cluster {cluster_id} has only 1 member<br>Cannot compute intra-cluster distances",
+            text=f"Cluster {_display_cluster_id(cluster_id)} has only 1 member<br>Cannot compute intra-cluster distances",
             xref="paper", yref="paper",
             x=0.5, y=0.5, showarrow=False,
             font=dict(size=14, color="gray")
@@ -1848,7 +2005,7 @@ def create_single_intra_cluster_heatmap(distance_matrix, labels, cluster_id, pdb
     avg_distance = submatrix[np.triu_indices_from(submatrix, k=1)].mean()
     
     fig.update_layout(
-        title=f'Cluster {cluster_id} Intra-Cluster {metric_name}<br>'
+        title=f'Cluster {_display_cluster_id(cluster_id)} Intra-Cluster {metric_name}<br>'
               f'<sub>{len(members)} members | Avg {metric_name}: {avg_distance:.3f}</sub>',
         xaxis_title='Structure',
         yaxis_title='Structure',
@@ -2017,7 +2174,7 @@ def create_contact_residue_heatmap(contact_residue_pairs, labels, pdb_files, clu
     if len(cluster_indices) == 0:
         fig = go.Figure()
         fig.add_annotation(
-            text=f"Cluster {cluster_id} has no structures",
+            text=f"Cluster {_display_cluster_id(cluster_id)} has no structures",
             xref="paper", yref="paper",
             x=0.5, y=0.5, showarrow=False,
             font=dict(size=14, color="gray")
@@ -2199,7 +2356,7 @@ def create_contact_residue_heatmap(contact_residue_pairs, labels, pdb_files, clu
     plot_height = max(300, n_structures * row_height)
     
     fig.update_layout(
-        title=f'Cluster {cluster_id} Contact Distance Pattern<br><sub>Structures ordered by contact similarity (hierarchical clustering). Redder = closer contact.</sub>',
+        title=f'Cluster {_display_cluster_id(cluster_id)} Contact Distance Pattern<br><sub>Structures ordered by contact similarity (hierarchical clustering). Redder = closer contact.</sub>',
         xaxis_title='Protein Residue',
         yaxis_title='Structure',
         height=plot_height,

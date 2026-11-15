@@ -1,0 +1,18 @@
+name: structural
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - freesasa
+  - scikit-learn
+  - seaborn
+  - jinja2
+  - mdtraj
+  - biopython
+#  - dssp
+prefix: /Users/Zen/miniconda3/envs/structural
+
+#DSSP function is no longer needed and used by current version of ClustalDM.

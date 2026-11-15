@@ -35,12 +35,9 @@ try:
         create_scatter_multimethod,
         create_hotspot_histogram,
         create_molstar_viewer_html as create_mol_viewer_html,  # Use Molstar instead of py3Dmol
+        create_molstar_superposition_html,
         create_distance_heatmap,
         create_cluster_size_distribution,
-    )
-    from visualization.sequence_alignment import (
-        create_alignment_visualization_medoids,
-        create_alignment_visualization_within_cluster
     )
     print("✓ Core and visualization modules loaded (using Molstar)")
 except ImportError as e:
@@ -711,6 +708,7 @@ app_ui = ui.page_fluid(
                     ui.output_ui("svd_elbow_plot"),
                     ui.output_ui("svd_grid_search_table"),
                     ui.output_ui("svd_cluster_elbow_plot"),
+                    ui.output_ui("svd_key_residues_info"),
                     ui.output_data_frame("svd_loadings_table"),
                     ui.output_data_frame("svd_isolated_points_table"),
                     ui.output_data_frame("svd_model_coordinates_table")
@@ -904,44 +902,6 @@ app_ui = ui.page_fluid(
                 )
             ),
             ui.nav_panel(
-                "🧬 Sequence QC",
-                ui.card(
-                    ui.card_header("Sequence Alignment Quality Control"),
-                    ui.markdown("""
-                        **Visualize secondary structure and pLDDT confidence for:**
-                        - **Medoid Comparison**: Compare secondary structure across cluster medoids
-                        - **Within Cluster**: Examine all structures within a single cluster
-                        
-                        *Colour Key*  
-                        *pLDDT score*: Dark blue (>90), Light blue (70-90), Yellow (50-70), Orange (<50)  
-                        *Secondary Structure*:  
-                            α-helix (H, red), 3-10 helix (G, orange), π-helix (I, pink),  
-                            β-sheet (E, blue), β-bridge (B, light blue),  
-                            Turn (T, green), Bend (S, yellow), Coil/Undefined (-, gray).  
-                    """),
-                    ui.input_radio_buttons(
-                        "sequence_viz_mode",
-                        "Visualization Mode:",
-                        choices={
-                            "medoids": "Medoid Comparison (across clusters)",
-                            "within": "Within Cluster (all structures)"
-                        },
-                        selected="medoids",
-                        inline=True
-                    ),
-                    ui.panel_conditional(
-                        "input.sequence_viz_mode === 'within'",
-                        ui.input_select(
-                            "sequence_viz_cluster",
-                            "Select Cluster:",
-                            choices={},
-                            width="300px"
-                        )
-                    ),
-                    ui.output_ui("sequence_alignment_plot")
-                )
-            ),
-            ui.nav_panel(
                 "📋 Structure Details",
                 ui.card(
                     ui.card_header("Interface statistics for all structures"),
@@ -987,6 +947,47 @@ app_ui = ui.page_fluid(
                         ui.input_select("structure_select", "Select Structure:", 
                                        choices=[], 
                                        width="300px"),
+                        ui.input_checkbox(
+                            "viewer_superimpose",
+                            "Superimpose selected models",
+                            value=False
+                        ),
+                        ui.panel_conditional(
+                            "input.viewer_superimpose === true",
+                            ui.input_radio_buttons(
+                                "viewer_compare_mode",
+                                "Comparison scope:",
+                                choices={
+                                    "within": "Within active cluster",
+                                    "cross": "Across two clusters"
+                                },
+                                selected="within",
+                                inline=True
+                            ),
+                            ui.panel_conditional(
+                                "input.viewer_compare_mode === 'within'",
+                                ui.input_selectize(
+                                    "superimpose_structures",
+                                    "Models to overlay:",
+                                    choices=[],
+                                    multiple=True,
+                                    width="300px"
+                                )
+                            ),
+                            ui.panel_conditional(
+                                "input.viewer_compare_mode === 'cross'",
+                                ui.input_selectize(
+                                    "viewer_compare_clusters",
+                                    "Filter by clusters:", choices={},
+                                    multiple=True, width="300px"
+                                ),
+                                ui.input_selectize(
+                                    "viewer_compare_models",
+                                    "Models to overlay:", choices=[],
+                                    multiple=True, width="300px"
+                                )
+                            ),
+                        ),
                         col_widths=[3, 4, 5]
                         ),
                         ui.output_ui("structure_info"),
@@ -1044,6 +1045,10 @@ def server(input, output, session):
         except Exception:
             return default
         return default if value is None else value
+
+    def display_cluster_id(cluster_id):
+        """Return the one-based cluster number shown to users."""
+        return int(cluster_id) + 1 if int(cluster_id) >= 0 else "Noise"
 
     def get_svd_settings():
         """Resolve the explicit SNN strategy into clusterer arguments."""
@@ -1328,7 +1333,7 @@ def server(input, output, session):
             info_content = "=== CLUSTER INFORMATION ===\n\n"
             unique_labels = sorted(set(clust.labels))
             for label in unique_labels:
-                cluster_name = f"Cluster {label}" if label != -1 else "Noise"
+                cluster_name = f"Cluster {display_cluster_id(label)}" if label != -1 else "Noise"
                 members = [os.path.basename(clust.pdb_files[i]) for i, l in enumerate(clust.labels) if l == label]
                 info_content += f"{cluster_name}: {len(members)} structures\n"
                 for member in members:
@@ -1338,40 +1343,135 @@ def server(input, output, session):
             
             # Add CSV files
             if interface_stats.get() is not None:
-                csv_buffer = interface_stats.get().to_csv(index=False)
-                zipf.writestr("cluster_statistics.csv", csv_buffer)
+                stats_export = interface_stats.get().copy()
+                if 'cluster' in stats_export.columns:
+                    stats_export['cluster'] = stats_export['cluster'].map(display_cluster_id)
+                csv_buffer = stats_export.to_csv(index=False)
+                zipf.writestr("csv_exports/cluster_statistics.csv", csv_buffer)
             
             if cluster_summary.get() is not None:
-                csv_buffer = cluster_summary.get().to_csv(index=False)
-                zipf.writestr("cluster_summary.csv", csv_buffer)
+                summary_export = cluster_summary.get().copy()
+                if 'cluster' in summary_export.columns:
+                    summary_export['cluster'] = summary_export['cluster'].map(display_cluster_id)
+                csv_buffer = summary_export.to_csv(index=False)
+                zipf.writestr("csv_exports/cluster_summary.csv", csv_buffer)
             
             if rmsd_stats.get() is not None:
                 csv_buffer = rmsd_stats.get().to_csv(index=False)
-                zipf.writestr("cluster_rmsd_summary.csv", csv_buffer)
+                zipf.writestr("csv_exports/cluster_rmsd_summary.csv", csv_buffer)
 
             if tm_score_stats.get() is not None:
                 csv_buffer = tm_score_stats.get().to_csv(index=False)
-                zipf.writestr("tm_score_vs_reference.csv", csv_buffer)
+                zipf.writestr("csv_exports/tm_score_vs_reference.csv", csv_buffer)
+
+            if getattr(clust, 'svd_elbow_data', None) is not None:
+                from core.reporting import write_svd_diagnostics
+                with tempfile.TemporaryDirectory() as report_dir:
+                    write_svd_diagnostics(clust, report_dir)
+                    report_root = Path(report_dir)
+                    for report_file in report_root.rglob('*'):
+                        if report_file.is_file():
+                            zipf.write(
+                                report_file,
+                                arcname=str(report_file.relative_to(report_root))
+                            )
+
+            from clustal_cli import generate_summary_html
+            with tempfile.TemporaryDirectory() as report_dir:
+                report_root = Path(report_dir)
+                for report_subdir in ('html_reports', 'csv_exports', 'plots', 'cluster_representatives'):
+                    (report_root / report_subdir).mkdir(parents=True, exist_ok=True)
+                summary_for_report = cluster_summary.get().copy()
+                if 'cluster' in summary_for_report.columns:
+                    summary_for_report['cluster'] = summary_for_report['cluster'].map(display_cluster_id)
+                shiny_report_files = [
+                    'html_reports/qc_summary.html',
+                    'html_reports/cluster_visualization.html',
+                    'html_reports/cluster_size_distribution.html',
+                    'html_reports/dendrogram.html',
+                    'html_reports/dimensionality_reduction.html',
+                    'html_reports/jaccard_heatmap.html'
+                ]
+                if rmsd_matrix.get() is not None:
+                    shiny_report_files.append('html_reports/rmsd_heatmap.html')
+                if any(
+                    sum(1 for label in clust.labels if label == cluster_id) > 1
+                    for cluster_id in set(clust.labels) if cluster_id >= 0
+                ):
+                    shiny_report_files.append('html_reports/intra_cluster_heatmaps.html')
+                overall_hotspots_for_manifest = clust.get_binding_hotspots()
+                if overall_hotspots_for_manifest is not None and not overall_hotspots_for_manifest.empty:
+                    shiny_report_files.append('html_reports/hotspots_overall.html')
+                    shiny_report_files.append('html_reports/contact_hotspots_by_cluster.html')
+                if getattr(clust, 'hdbscan_clusterer', None) is not None:
+                    shiny_report_files.extend([
+                        'html_reports/condensed_tree.html',
+                        'html_reports/hdbscan_linkage_tree.html'
+                    ])
+                if getattr(clust, 'svd_elbow_data', None) is not None:
+                    shiny_report_files.extend([
+                        'html_reports/svd_elbow.html',
+                        'html_reports/svd_component_k_grid_search.html',
+                        'html_reports/svd_cluster_count_wcss.html'
+                    ])
+                summary_path = generate_summary_html(
+                    {
+                        'html': report_root / 'html_reports',
+                        'csv': report_root / 'csv_exports',
+                        'plots': report_root / 'plots',
+                        'pdb': report_root / 'cluster_representatives'
+                    },
+                    {
+                        'models': af2_models_dir.get() or '',
+                        'n_structures': len(clust.pdb_files),
+                        'clustering_method': (
+                            'svd_leiden' if getattr(clust, 'clustering_input_mode', '') == 'svd_snn'
+                            else 'hdbscan'
+                        ),
+                        'protein_chains': ', '.join(getattr(clust, 'protein_chains', [])),
+                        'distance_cutoff': 4.5,
+                        'min_cluster_size': read_optional_input('min_cluster_size', 'not used'),
+                        'min_samples': read_optional_input('min_samples_hdb', 'not used'),
+                        'hdbscan_epsilon': read_optional_input('hdbscan_epsilon', 'not used'),
+                        'hdbscan_selection_method': read_optional_input('hdbscan_selection_method', 'not used'),
+                        'apply_offset': read_optional_input('apply_residue_offset', False),
+                        'filter_duplicates': read_optional_input('filter_duplicates', False),
+                        'svd_optimization_mode': read_optional_input('svd_optimization_mode', 'not used'),
+                        'svd_components_input': read_optional_input('svd_manual_components', 'auto'),
+                        'svd_k_input': read_optional_input('svd_manual_k', 'auto'),
+                        'svd_snn_epsilon': read_optional_input('svd_snn_epsilon', 'not used'),
+                        'svd_prune_edges': read_optional_input('svd_prune_edges', False),
+                        'svd_min_shared_neighbors': read_optional_input('svd_min_shared_neighbors', 'not used'),
+                        'svd_max_intra_jaccard': read_optional_input('svd_max_intra_jaccard', 'not used')
+                    },
+                    summary_for_report,
+                    float(getattr(clust, 'analysis_time_seconds', 0.0)),
+                    report_files=shiny_report_files,
+                    results={
+                        'Clusters Found': int(sum(1 for label in clust.labels if label != -1)),
+                        'Noise Points': int(sum(1 for label in clust.labels if label == -1)),
+                        'Selected SVD Components': getattr(clust, 'svd_optimized_components', None),
+                        'Selected SNN k': getattr(clust, 'svd_optimized_k', None)
+                    }
+                )
+                zipf.write(summary_path, arcname='index.html')
 
             if svd_loadings.get() is not None:
-                zipf.writestr("svd_residue_feature_loadings.csv", svd_loadings.get().to_csv(index=False))
+                zipf.writestr("csv_exports/svd_residue_feature_loadings.csv", svd_loadings.get().to_csv(index=False))
             if svd_isolated_points.get() is not None:
-                zipf.writestr("svd_isolated_network_points.csv", svd_isolated_points.get().to_csv(index=False))
+                zipf.writestr("csv_exports/svd_isolated_network_points.csv", svd_isolated_points.get().to_csv(index=False))
             if svd_model_coordinates.get() is not None:
-                zipf.writestr("svd_model_coordinates.csv", svd_model_coordinates.get().to_csv(index=False))
-            if getattr(clust, 'svd_elbow_data', None) is not None:
-                zipf.writestr("svd_elbow_curve.csv", clust.svd_elbow_data.to_csv(index=False))
-            if getattr(clust, 'svd_cluster_elbow_data', None) is not None:
-                zipf.writestr("svd_cluster_count_wcss_curve.csv", clust.svd_cluster_elbow_data.to_csv(index=False))
-            if getattr(clust, 'svd_grid_search_data', None) is not None:
-                zipf.writestr("svd_component_k_grid_search.csv", clust.svd_grid_search_data.to_csv(index=False))
-            
+                zipf.writestr("csv_exports/svd_model_coordinates.csv", svd_model_coordinates.get().to_csv(index=False))
             # Add plots as HTML
             try:
                 from visualization.interactive import (
                     create_interactive_scatter,
+                    create_scatter_multimethod,
                     create_cluster_size_distribution,
                     create_distance_heatmap,
+                    create_distance_heatmap_with_dendrogram,
+                    create_hotspot_histogram,
+                    create_contact_residue_heatmap,
                     create_hdbscan_condensed_tree,
                     create_hdbscan_tree,
                     compute_cluster_distance_matrix,
@@ -1384,12 +1484,36 @@ def server(input, output, session):
                 # Cluster scatter plot
                 if interface_stats.get() is not None:
                     fig = create_interactive_scatter(
-                        clust,
                         interface_stats.get(),
-                        rmsd_matrix.get(),
-                        pdb_dir_path
+                        rmsd_matrix.get() if rmsd_matrix.get() is not None
+                        else clust.distance_matrix
                     )
-                    zipf.writestr("cluster_visualization.html", fig.to_html())
+                    zipf.writestr("html_reports/cluster_visualization.html", fig.to_html())
+
+                    fig = create_scatter_multimethod(
+                        interface_stats.get(),
+                        clust.jaccard_distance_matrix,
+                        method='mds'
+                    )
+                    from clustal_cli import create_multi_view_html
+                    dimred_figures = {'MDS': fig}
+                    for method in ('tsne', 'pca', 'umap'):
+                        try:
+                            dimred_figures[method.upper()] = create_scatter_multimethod(
+                                interface_stats.get(),
+                                clust.jaccard_distance_matrix,
+                                method=method
+                            )
+                        except Exception as dimred_error:
+                            print(f"Could not generate Shiny {method.upper()} report view: {dimred_error}")
+                    with tempfile.TemporaryDirectory() as dimred_dir:
+                        dimred_path = Path(dimred_dir) / "dimensionality_reduction.html"
+                        create_multi_view_html(
+                            dimred_figures, dimred_path,
+                            'Cluster Visualization - Dimensionality Reduction',
+                            default_view='MDS'
+                        )
+                        zipf.write(dimred_path, arcname="html_reports/dimensionality_reduction.html")
                 
                 # Size distribution
                 fig = create_cluster_size_distribution(
@@ -1397,7 +1521,22 @@ def server(input, output, session):
                     duplicate_groups=getattr(clust, 'duplicate_groups', None),
                     rescued_cluster_ids=getattr(clust, 'rescued_cluster_ids', None)
                 )
-                zipf.writestr("cluster_size_distribution.html", fig.to_html())
+                zipf.writestr("html_reports/cluster_size_distribution.html", fig.to_html())
+
+                qc_figures = {
+                    'Cluster Sizes': fig,
+                }
+                cluster_matrix, cluster_ids, cluster_sizes = compute_cluster_distance_matrix(
+                    clust.jaccard_distance_matrix, clust.labels
+                )
+                qc_figures['Inter-Cluster Distances'] = create_cluster_distance_heatmap(
+                    cluster_matrix, cluster_ids, cluster_sizes, metric_name='Jaccard Distance'
+                )
+                from clustal_cli import create_multi_view_html
+                with tempfile.TemporaryDirectory() as qc_dir:
+                    qc_path = Path(qc_dir) / "qc_summary.html"
+                    create_multi_view_html(qc_figures, qc_path, 'Clustering QC Summary')
+                    zipf.write(qc_path, arcname="html_reports/qc_summary.html")
                 
                 
                 # Heatmaps
@@ -1407,7 +1546,15 @@ def server(input, output, session):
                     title="Jaccard Distance Matrix",
                     pdb_files=clust.pdb_files
                 )
-                zipf.writestr("jaccard_heatmap.html", fig.to_html())
+                zipf.writestr("html_reports/jaccard_heatmap.html", fig.to_html())
+
+                fig = create_distance_heatmap_with_dendrogram(
+                    clust.jaccard_distance_matrix,
+                    clust.labels,
+                    metric_name="Jaccard Distance",
+                    pdb_files=clust.pdb_files
+                )
+                zipf.writestr("html_reports/dendrogram.html", fig.to_html())
                 
                 if rmsd_matrix.get() is not None:
                     fig = create_distance_heatmap(
@@ -1416,7 +1563,63 @@ def server(input, output, session):
                         title="RMSD Distance Matrix",
                         pdb_files=clust.pdb_files
                     )
-                    zipf.writestr("rmsd_heatmap.html", fig.to_html())
+                    zipf.writestr("html_reports/rmsd_heatmap.html", fig.to_html())
+
+                intra_parts = []
+                for cluster_id in sorted(set(clust.labels)):
+                    if cluster_id < 0:
+                        continue
+                    members = [i for i, label in enumerate(clust.labels) if label == cluster_id]
+                    if len(members) > 1:
+                        intra_fig = create_single_intra_cluster_heatmap(
+                            clust.jaccard_distance_matrix, clust.labels, cluster_id,
+                            clust.pdb_files, metric_name="Jaccard Distance"
+                        )
+                        intra_parts.append(
+                            f"<h2>Cluster {display_cluster_id(cluster_id)}</h2>"
+                            + intra_fig.to_html(full_html=False, include_plotlyjs='cdn')
+                        )
+                if intra_parts:
+                    zipf.writestr(
+                        "html_reports/intra_cluster_heatmaps.html",
+                        "<html><body>" + "".join(intra_parts) + "</body></html>"
+                    )
+
+                overall_hotspots = clust.get_binding_hotspots()
+                if overall_hotspots is not None and not overall_hotspots.empty:
+                    hotspot_fig = create_hotspot_histogram(overall_hotspots)
+                    zipf.writestr("html_reports/hotspots_overall.html", hotspot_fig.to_html())
+
+                hotspot_parts = []
+                for cluster_id in sorted(set(clust.labels)):
+                    if cluster_id < 0:
+                        continue
+                    cluster_hotspots = clust.get_binding_hotspots(cluster_id=cluster_id)
+                    if cluster_hotspots is None or cluster_hotspots.empty:
+                        continue
+                    hotspot_fig = create_hotspot_histogram(cluster_hotspots)
+                    hotspot_parts.append(
+                        f"<h2>Cluster {display_cluster_id(cluster_id)}</h2>"
+                        + hotspot_fig.to_html(full_html=False, include_plotlyjs='cdn')
+                    )
+                if hotspot_parts:
+                    zipf.writestr(
+                        "html_reports/contact_hotspots_by_cluster.html",
+                        "<html><body>" + "".join(hotspot_parts) + "</body></html>"
+                    )
+
+                if getattr(clust, 'hdbscan_clusterer', None) is not None:
+                    condensed = create_hdbscan_condensed_tree(
+                        clust, labels=clust.labels, pdb_files=clust.pdb_files
+                    )
+                    zipf.writestr(
+                        "html_reports/condensed_tree.html",
+                        f"<html><body>{condensed}</body></html>"
+                    )
+                    linkage = create_hdbscan_tree(
+                        clust.hdbscan_clusterer, clust.labels, clust.pdb_files
+                    )
+                    zipf.writestr("html_reports/hdbscan_linkage_tree.html", linkage)
 
             except Exception as e:
                 print(f"Error generating plots for ZIP: {e}")
@@ -1445,7 +1648,7 @@ def server(input, output, session):
         cluster_indices = [i for i, label in enumerate(clust.labels) if label == cluster_id]
         
         if not cluster_indices:
-            ui.notification_show(f"No structures found in cluster {cluster_id}", type="warning")
+            ui.notification_show(f"No structures found in cluster {display_cluster_id(cluster_id)}", type="warning")
             return None
         
         # Create ZIP file
@@ -1457,7 +1660,7 @@ def server(input, output, session):
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             # Add cluster info
             info_lines = [
-                f"Cluster {cluster_id} - {len(cluster_indices)} structures\n",
+                f"Cluster {display_cluster_id(cluster_id)} - {len(cluster_indices)} structures\n",
                 "="*50 + "\n\n"
             ]
             
@@ -1484,7 +1687,7 @@ def server(input, output, session):
                     zipf.write(pdb_path, arcname=os.path.basename(pdb_path))
             
             ui.notification_show(
-                f"Exported {len(cluster_indices)} PDB files from cluster {cluster_id}",
+                f"Exported {len(cluster_indices)} PDB files from cluster {display_cluster_id(cluster_id)}",
                 type="message",
                 duration=3
             )
@@ -1516,7 +1719,9 @@ def server(input, output, session):
         
         # Import necessary modules at function start
         import os
+        import time
         import MDAnalysis as mda
+        analysis_started = time.time()
         
         # Clear previous log
         status_log.set([])
@@ -1980,7 +2185,7 @@ def server(input, output, session):
                 if int(cid) == -1:
                     cluster_choices[cid] = f"Noise ({n_structs} structures)"
                 else:
-                    cluster_choices[cid] = f"Cluster {cid} ({n_structs} structures)"
+                    cluster_choices[cid] = f"Cluster {display_cluster_id(cid)} ({n_structs} structures)"
             # Add "All Clusters" option at the end
             cluster_choices["all"] = "All Clusters (use with caution!)"
             
@@ -1989,7 +2194,7 @@ def server(input, output, session):
             for cid in cluster_ids:
                 if int(cid) >= 0:  # Exclude noise (-1)
                     n_structs = sum(1 for l in clust.labels if l == int(cid))
-                    intra_cluster_choices[cid] = f"Cluster {cid} ({n_structs} structures)"
+                    intra_cluster_choices[cid] = f"Cluster {display_cluster_id(cid)} ({n_structs} structures)"
             
             # Default to Cluster 1 (second cluster, usually smaller)
             # Fall back to cluster 0 if only 1 cluster, or "all" if no clusters
@@ -2005,17 +2210,25 @@ def server(input, output, session):
             
             ui.update_select("filter_cluster", choices=cluster_choices, selected=default_cluster)
             ui.update_select("viewer_cluster", choices=cluster_choices, selected=default_cluster)
+            comparison_choices = {
+                key: value for key, value in cluster_choices.items()
+                if key != "all" and int(key) >= 0
+            }
+            comparison_ids = list(comparison_choices)
+            ui.update_selectize(
+                "viewer_compare_clusters", choices=comparison_choices,
+                selected=comparison_ids
+            )
             ui.update_select("cluster_select_hotspot", choices=cluster_ids)
             ui.update_select("contact_heatmap_cluster", choices=cluster_ids, selected=default_intra)
             ui.update_select("jaccard_intra_cluster", choices=intra_cluster_choices, selected=default_intra)
             ui.update_select("rmsd_intra_cluster", choices=intra_cluster_choices, selected=default_intra)
-            ui.update_select("sequence_viz_cluster", choices=cluster_ids, selected=default_intra)
             
             # Update export cluster dropdown (only specific clusters, no "all" option)
             export_choices = {}
             for cid in cluster_ids:
                 n_structs = sum(1 for l in clust.labels if l == int(cid))
-                export_choices[cid] = f"Cluster {cid} ({n_structs} structures)"
+                export_choices[cid] = f"Cluster {display_cluster_id(cid)} ({n_structs} structures)"
             ui.update_select("export_cluster", choices=export_choices, selected=default_cluster if default_cluster != "all" else cluster_ids[0] if cluster_ids else "")
             
             # Initialize structure dropdown for 3D viewer with default cluster
@@ -2026,13 +2239,16 @@ def server(input, output, session):
                 filtered_indices = [i for i, label in enumerate(clust.labels) if label == cluster_id]
                 filtered_names = [structure_names[i] for i in filtered_indices]
                 ui.update_select("structure_select", choices=filtered_names)
+                ui.update_selectize("superimpose_structures", choices=filtered_names, selected=[])
             else:
                 # Show all structures
                 ui.update_select("structure_select", choices=structure_names)
+                ui.update_selectize("superimpose_structures", choices=structure_names, selected=[])
 
             bump_cluster_refresh()
             
             # Set analysis complete flag
+            clust.analysis_time_seconds = time.time() - analysis_started
             analysis_complete.set(True)
             log_status("="*50)
             log_status("✅ Analysis Complete!")
@@ -2263,7 +2479,7 @@ def server(input, output, session):
                 if int(cid) == -1:
                     cluster_choices[cid] = f"Noise ({n_structs} structures)"
                 else:
-                    cluster_choices[cid] = f"Cluster {cid} ({n_structs} structures)"
+                    cluster_choices[cid] = f"Cluster {display_cluster_id(cid)} ({n_structs} structures)"
             # Add "All Clusters" option at the end
             cluster_choices["all"] = "All Clusters (use with caution!)"
 
@@ -2271,7 +2487,7 @@ def server(input, output, session):
             for cid in cluster_ids:
                 if int(cid) >= 0:
                     n_structs = sum(1 for l in clust.labels if l == int(cid))
-                    intra_cluster_choices[cid] = f"Cluster {cid} ({n_structs} structures)"
+                    intra_cluster_choices[cid] = f"Cluster {display_cluster_id(cid)} ({n_structs} structures)"
             
             # Default to Cluster 1 (second cluster, usually smaller)
             if len(cluster_ids) > 1:
@@ -2285,11 +2501,19 @@ def server(input, output, session):
             
             ui.update_select("filter_cluster", choices=cluster_choices, selected=default_cluster)
             ui.update_select("viewer_cluster", choices=cluster_choices, selected=default_cluster)
+            comparison_choices = {
+                key: value for key, value in cluster_choices.items()
+                if key != "all" and int(key) >= 0
+            }
+            comparison_ids = list(comparison_choices)
+            ui.update_selectize(
+                "viewer_compare_clusters", choices=comparison_choices,
+                selected=comparison_ids
+            )
             ui.update_select("cluster_select_hotspot", choices=cluster_ids)
             ui.update_select("contact_heatmap_cluster", choices=cluster_ids, selected=default_intra)
             ui.update_select("jaccard_intra_cluster", choices=intra_cluster_choices, selected=default_intra)
             ui.update_select("rmsd_intra_cluster", choices=intra_cluster_choices, selected=default_intra)
-            ui.update_select("sequence_viz_cluster", choices=cluster_ids, selected=default_intra)
             
             # Update export cluster dropdown
             export_choices = {}
@@ -2305,8 +2529,10 @@ def server(input, output, session):
                 filtered_indices = [i for i, label in enumerate(clust.labels) if label == cluster_id]
                 filtered_names = [structure_names[i] for i in filtered_indices]
                 ui.update_select("structure_select", choices=filtered_names)
+                ui.update_selectize("superimpose_structures", choices=filtered_names, selected=[])
             else:
                 ui.update_select("structure_select", choices=structure_names)
+                ui.update_selectize("superimpose_structures", choices=structure_names, selected=[])
 
             bump_cluster_refresh()
             
@@ -2324,6 +2550,66 @@ def server(input, output, session):
             import traceback
             traceback.print_exc()
     
+    @reactive.effect
+    @reactive.event(input.viewer_compare_clusters, input.structure_type)
+    def update_cross_structure_choices():
+        """Refresh model choices for arbitrary cross-cluster comparison."""
+        if clust is None:
+            return
+
+        structure_names = [os.path.basename(path) for path in clust.pdb_files]
+        structure_type = input.structure_type()
+        stats_df = interface_stats.get()
+        medoid_map = {}
+        if stats_df is not None and 'representative' in stats_df.columns:
+            for cluster_id in set(clust.labels):
+                representative = stats_df[
+                    (stats_df['cluster'] == cluster_id) &
+                    (stats_df['representative'] == True)
+                ]
+                if not representative.empty:
+                    name = representative.iloc[0]['structure']
+                    medoid_map[cluster_id] = next(
+                        (index for index, path in enumerate(clust.pdb_files)
+                         if os.path.basename(path) == name),
+                        None
+                    )
+
+        selected_clusters = input.viewer_compare_clusters() or []
+        if isinstance(selected_clusters, str):
+            selected_clusters = [selected_clusters]
+        selected_ids = {int(value) for value in selected_clusters}
+        selected_models = input.viewer_compare_models() or []
+        if isinstance(selected_models, str):
+            selected_models = [selected_models]
+        else:
+            selected_models = list(selected_models)
+        filtered_indices = [
+            index for index, label in enumerate(clust.labels)
+            if label in selected_ids
+        ]
+        if structure_type == 'medoid':
+            filtered_indices = [
+                medoid_map[cluster_id] for cluster_id in selected_ids
+                if cluster_id in medoid_map
+            ]
+        visible_names = [structure_names[index] for index in filtered_indices]
+        # The cluster control is a browsing filter. Keep already selected
+        # models available when their cluster is deselected.
+        choice_names = list(dict.fromkeys(visible_names + selected_models))
+        choice_labels = {
+            name: (
+                f"Cluster {display_cluster_id(clust.labels[structure_names.index(name)])}: {name}"
+                if name in structure_names else name
+            )
+            for name in choice_names
+        }
+        ui.update_selectize(
+            "viewer_compare_models",
+            choices=choice_labels,
+            selected=selected_models
+        )
+
     @reactive.effect
     @reactive.event(input.viewer_cluster, input.structure_type)
     def update_structure_choices():
@@ -2389,6 +2675,7 @@ def server(input, output, session):
         
         filtered_names = [structure_names[i] for i in filtered_indices]
         ui.update_select("structure_select", choices=filtered_names)
+        ui.update_selectize("superimpose_structures", choices=filtered_names, selected=[])
     
     @output
     @render.text
@@ -2455,44 +2742,22 @@ def server(input, output, session):
             print("DEBUG: Early return - not ready", flush=True)
             return ui.p("Run analysis to see metrics", style="padding: 20px; text-align: center;")
         
-        # Get clustering quality score from HDBSCAN
-        # We use median GLOSH (Global-Local Outlier Score from Hierarchies)
-        # GLOSH measures how outlier-like each point is
-        # Lower scores = better clustering (points are more inlier-like)
-        quality_score = 0.0
-        metric_label = "Cluster Quality"
-        
-        print(f"DEBUG: clust object type: {type(clust)}", flush=True)
-        print(f"DEBUG: clust is None? {clust is None}", flush=True)
-        sys.stdout.flush()
-        
+        quality_score = np.nan
+        metric_label = "Silhouette Score"
+
         try:
-            if clust is None:
-                print("DEBUG: clust is None!", flush=True)
-            elif not hasattr(clust, 'hdbscan_clusterer'):
-                print("DEBUG: clust has no hdbscan_clusterer attribute", flush=True)
-            elif clust.hdbscan_clusterer is None:
-                print("DEBUG: clust.hdbscan_clusterer is None", flush=True)
-            elif not hasattr(clust.hdbscan_clusterer, 'outlier_scores_'):
-                print("DEBUG: hdbscan_clusterer has no outlier_scores_ attribute", flush=True)
-            else:
-                outlier_scores = clust.hdbscan_clusterer.outlier_scores_
-                print(f"DEBUG: Raw GLOSH scores shape: {outlier_scores.shape}", flush=True)
-                finite_scores = outlier_scores[np.isfinite(outlier_scores)]
-                print(f"DEBUG: Finite GLOSH scores: min={finite_scores.min():.3f}, max={finite_scores.max():.3f}", flush=True)
-                if len(finite_scores) > 0:
-                    quality_score = np.median(finite_scores)
-                    metric_label = "Median GLOSH"
-                    print(f"DEBUG: Computed quality_score (median GLOSH) = {quality_score}", flush=True)
-                else:
-                    print("DEBUG: No finite GLOSH values!", flush=True)
-            sys.stdout.flush()
+            from sklearn.metrics import silhouette_score
+            labels_for_quality = np.asarray(clust.labels)
+            valid_mask = labels_for_quality >= 0
+            valid_labels = labels_for_quality[valid_mask]
+            if valid_mask.sum() > 2 and len(np.unique(valid_labels)) >= 2:
+                quality_score = float(silhouette_score(
+                    clust.jaccard_distance_matrix[np.ix_(valid_mask, valid_mask)],
+                    valid_labels,
+                    metric='precomputed'
+                ))
         except Exception as e:
-            print(f"DEBUG: Error getting clustering quality: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
-            sys.stdout.flush()
-            quality_score = 0.0
+            print(f"Quality metric unavailable: {e}", flush=True)
         
         # Get sequential RMSD from cluster summary
         rmsd_qc_df = rmsd_stats.get()
@@ -2511,7 +2776,10 @@ def server(input, output, session):
         # 3 structure quality cards
         return ui.TagList(
             ui.div(
-                ui.h2(f"{quality_score:.3f}", class_="text-success", style="font-size: 3em; margin: 10px 0;"),
+                ui.h2(
+                    "N/A" if pd.isna(quality_score) else f"{quality_score:.3f}",
+                    class_="text-success", style="font-size: 3em; margin: 10px 0;"
+                ),
                 ui.p(metric_label, style="margin: 5px 0;"),
                 #ui.p("Lower = better clustering", style="margin: 0; font-size: 0.8em; color: #666;"),
                 class_="text-center mb-3",
@@ -2596,6 +2864,10 @@ def server(input, output, session):
         # Only show columns that actually exist
         available_cols = [col for col in display_cols if col in summary_df.columns]
         display_df = summary_df[available_cols].copy()
+        if 'cluster' in display_df.columns:
+            display_df['cluster'] = display_df['cluster'].map(display_cluster_id)
+        if 'binding_mode' in display_df.columns:
+            display_df['binding_mode'] = display_df['binding_mode'].astype(str)
 
         # Apply cluster search/filter if provided
         try:
@@ -2669,6 +2941,37 @@ def server(input, output, session):
             f"{explained_total:.1%} variance retained | "
             f"{len(isolated_df) if isolated_df is not None else 0} isolated network points",
             style="padding: 10px; color: #b0b0b0;"
+        )
+
+    @output
+    @render.ui
+    def svd_key_residues_info():
+        """Summarize residues with the strongest SVD component loadings."""
+        _ = cluster_refresh_tick.get()
+        loading_df = svd_loadings.get()
+        if loading_df is None or loading_df.empty:
+            return ui.p("Run SVD + SNN-Leiden to identify key residue features.", style="padding: 10px; color: #999;")
+        loading_columns = [
+            column for column in loading_df.columns
+            if column.endswith('_loading')
+        ]
+        if not loading_columns:
+            return ui.p("SVD loading data are unavailable.", style="padding: 10px; color: #999;")
+        rows = []
+        for column in loading_columns:
+            top = loading_df.loc[loading_df[column].abs().idxmax()]
+            rows.append(
+                f"Component {column.split('_')[1]}: {top['residue']} "
+                f"(loading {float(top[column]):+.3f})"
+            )
+        return ui.div(
+            ui.tags.strong("Key SVD residue features"),
+            ui.tags.small(
+                "Largest absolute loadings identify residues contributing most to "
+                "each retained component; they are indicators, not causal proof."
+            ),
+            ui.tags.ul(*[ui.tags.li(row) for row in rows[:10]]),
+            style="padding: 10px;"
         )
 
     @output
@@ -3076,7 +3379,7 @@ def server(input, output, session):
                 cluster_matrix, cluster_ids, cluster_sizes = compute_cluster_distance_matrix(jmat, labels)
                 if show_dendrogram:
                     # Create cluster labels for dendrogram
-                    cluster_labels = [f"Cluster {cid} (n={cluster_sizes[cid]})" for cid in cluster_ids]
+                    cluster_labels = [f"Cluster {display_cluster_id(cid)} (n={cluster_sizes[cid]})" for cid in cluster_ids]
                     # Create a temporary array with cluster labels as "pdb_files" for the dendrogram
                     fig = create_distance_heatmap_with_dendrogram(cluster_matrix, labels=None, metric_name='Jaccard Distance', pdb_files=cluster_labels)
                 else:
@@ -3137,7 +3440,7 @@ def server(input, output, session):
                 cluster_matrix, cluster_ids, cluster_sizes = compute_cluster_distance_matrix(rmsd_mat, labels)
                 if show_dendrogram:
                     # Create cluster labels for dendrogram
-                    cluster_labels = [f"Cluster {cid} (n={cluster_sizes[cid]})" for cid in cluster_ids]
+                    cluster_labels = [f"Cluster {display_cluster_id(cid)} (n={cluster_sizes[cid]})" for cid in cluster_ids]
                     fig = create_distance_heatmap_with_dendrogram(cluster_matrix, labels=None, metric_name='RMSD (Å)', pdb_files=cluster_labels)
                 else:
                     fig = create_cluster_distance_heatmap(cluster_matrix, cluster_ids, cluster_sizes, metric_name='RMSD (Å)')
@@ -3331,7 +3634,7 @@ def server(input, output, session):
                 warning_html = ""
             
             fig = create_hotspot_histogram(cluster_hotspots, top_n=None, smooth=True, split_by_chain=False)
-            fig.update_layout(title=f'Cluster {cluster_id} Binding Pattern ({n_structures} structures)')
+            fig.update_layout(title=f'Cluster {display_cluster_id(cluster_id)} Binding Pattern ({n_structures} structures)')
             
             html = fig.to_html(full_html=False, include_plotlyjs='require', div_id=f'cluster_{cluster_id}_hotspot')
             wrapped_html = f'<div style="width: 100%; height: 450px;">{html}</div>'
@@ -3341,109 +3644,6 @@ def server(input, output, session):
         except Exception as e:
             import traceback
             return ui.HTML(f"<pre style='color: red;'>Error: {e}\n{traceback.format_exc()}</pre>")
-    
-    @output
-    @render.ui
-    def sequence_alignment_plot():
-        """Sequence alignment QC visualization with secondary structure and pLDDT"""
-        _ = cluster_refresh_tick.get()
-        if clust is None or not analysis_complete.get():
-            return ui.p("Run analysis to view sequence QC", style="padding: 20px; text-align: center;")
-        
-        try:
-            mode = input.sequence_viz_mode()
-            
-            if mode == "medoids":
-                # Medoid comparison mode - get reference sequence if available
-                print(f"\n=== Checking for reference sequence ===")
-                print(f"  clust object exists: {clust is not None}")
-                print(f"  hasattr(clust, 'reference_sequence'): {hasattr(clust, 'reference_sequence') if clust else 'N/A'}")
-                print(f"  hasattr(clust, 'reference_pdb'): {hasattr(clust, 'reference_pdb') if clust else 'N/A'}")
-                
-                ref_seq = None
-                ref_pdb = None
-                
-                if clust and hasattr(clust, 'reference_sequence'):
-                    print(f"  clust.reference_sequence type: {type(clust.reference_sequence)}")
-                    print(f"  clust.reference_sequence is None: {clust.reference_sequence is None}")
-                    if clust.reference_sequence:
-                        print(f"  clust.reference_sequence length: {len(clust.reference_sequence)}")
-                        print(f"  First 50 chars: {clust.reference_sequence[:50]}")
-                        ref_seq = clust.reference_sequence
-                    else:
-                        print(f"  clust.reference_sequence is None or empty")
-                else:
-                    print(f"  No reference_sequence attribute on clusterer")
-                
-                if clust and hasattr(clust, 'reference_pdb'):
-                    print(f"  clust.reference_pdb: {clust.reference_pdb}")
-                    ref_pdb = clust.reference_pdb
-                
-                print(f"  ref_seq to pass: {ref_seq is not None} (length={len(ref_seq) if ref_seq else 0})")
-                print(f"  ref_pdb to pass: {ref_pdb}")
-                
-                # Check cluster_summary
-                print(f"\n=== Checking cluster_summary ===")
-                summary_df = cluster_summary.get()
-                print(f"  cluster_summary is None: {summary_df is None}")
-                if summary_df is not None:
-                    print(f"  cluster_summary shape: {summary_df.shape}")
-                    print(f"  cluster_summary columns: {list(summary_df.columns)}")
-                    if 'consensus_residues' in summary_df.columns:
-                        print(f"  Sample consensus_residues values:")
-                        for idx, row in summary_df.head(3).iterrows():
-                            print(f"    Cluster {row['cluster']}: '{row['consensus_residues']}'")
-                    else:
-                        print(f"  ⚠️ WARNING: 'consensus_residues' column NOT FOUND!")
-                print(f"===================================\n")
-                
-                fig = create_alignment_visualization_medoids(
-                    clust.pdb_files,
-                    clust.labels,
-                    reference_pdb=ref_pdb,
-                    reference_sequence=ref_seq,
-                    cluster_summary=summary_df,
-                    protein_chains=clust.protein_chains if hasattr(clust, 'protein_chains') else ['A'],
-                    reference_is_alphafold=input.reference_is_alphafold()
-                )
-            else:
-                # Within cluster mode
-                cluster_id_str = input.sequence_viz_cluster()
-                if not cluster_id_str:
-                    return ui.p("Select a cluster", style="padding: 20px; text-align: center;")
-                
-                cluster_id = int(cluster_id_str)
-                
-                fig = create_alignment_visualization_within_cluster(
-                    clust.pdb_files,
-                    clust.labels,
-                    cluster_id,
-                    protein_chains=clust.protein_chains if hasattr(clust, 'protein_chains') else ['A']
-                )
-            
-            # Convert to HTML with explicit config
-            print(f"\n=== FIGURE DEBUG ===")
-            print(f"Number of traces: {len(fig.data)}")
-            print(f"Figure height: {fig.layout.height}")
-            print(f"Subplot rows: {len([d for d in fig.data if hasattr(d, 'xaxis')])}")
-            if len(fig.data) > 0:
-                print(f"First trace type: {type(fig.data[0]).__name__}")
-                print(f"First trace x sample: {fig.data[0].x[:5] if hasattr(fig.data[0], 'x') and len(fig.data[0].x) > 0 else 'N/A'}")
-            print(f"====================\n")
-            
-            # Return just the raw plotly div without extra wrapper
-            config = {'displayModeBar': True, 'displaylogo': False}
-            html = fig.to_html(
-                full_html=False, 
-                include_plotlyjs='cdn',
-                config=config
-            )
-            return ui.HTML(html)
-            
-        except Exception as e:
-            import traceback
-            error_msg = f"Error creating sequence alignment visualization: {e}\n{traceback.format_exc()}"
-            return ui.HTML(f"<pre style='color: red;'>{error_msg}</pre>")
     
     @output
     @render.data_frame
@@ -3457,6 +3657,8 @@ def server(input, output, session):
         # Extract just cluster and consensus_residues columns
         if 'consensus_residues' in summary_df.columns:
             consensus_df = summary_df[['cluster', 'binding_mode', 'n_structures', 'n_consensus', 'consensus_residues']].copy()
+            consensus_df['cluster'] = consensus_df['cluster'].map(display_cluster_id)
+            consensus_df['binding_mode'] = consensus_df['binding_mode'].astype(str)
             
             # Rename for clarity
             consensus_df = consensus_df.rename(columns={
@@ -3564,6 +3766,8 @@ def server(input, output, session):
 
         # Create detailed table with contact lists
         display_df = stats_df.copy()
+        if 'cluster' in display_df.columns:
+            display_df['cluster'] = display_df['cluster'].map(display_cluster_id)
         
         # Keep full residue lists for display (don't truncate)
         # The DataGrid will handle scrolling and the user can see full text
@@ -3685,7 +3889,7 @@ def server(input, output, session):
                 
                 info_html = f"""
                 <div style="padding: 10px; background-color: #f8f9fa; margin-bottom: 10px; border-radius: 5px; border-left: 4px solid #0d6efd;">
-                    <b>{structure_name}</b> - <span style="color: #0d6efd;">Cluster {struct_info['cluster']}</span>{tm_score_display}<br style="clear: both;">
+                    <b>{structure_name}</b> - <span style="color: #0d6efd;">Cluster {display_cluster_id(struct_info['cluster'])}</span>{tm_score_display}<br style="clear: both;">
                     <small>Protein residues: {struct_info['n_protein_residues']} | DNA/RNA residues: {struct_info['n_nucleic_residues']}</small><br>
                     {contact_residues_html}
                 </div>
@@ -3705,16 +3909,60 @@ def server(input, output, session):
         if clust_ref is None:
             return ui.p("Run analysis first", style="padding: 20px; text-align: center;")
         
-        if not input.structure_select():
-            return ui.p("Select a structure to view in 3D", style="padding: 20px; text-align: center;")
-        
         try:
+            superimpose = bool(input.viewer_superimpose())
+            if superimpose:
+                compare_mode = input.viewer_compare_mode()
+                if compare_mode == 'cross':
+                    selected_names = input.viewer_compare_models() or []
+                    if isinstance(selected_names, str):
+                        selected_names = [selected_names]
+                    selected_clusters = input.viewer_compare_clusters() or []
+                    if isinstance(selected_clusters, str):
+                        selected_clusters = [selected_clusters]
+                    if len(selected_names) < 2 or not selected_clusters:
+                        return ui.p(
+                            "Select at least two models from the selected clusters to compare.",
+                            style="padding: 20px; text-align: center;"
+                        )
+                    cluster_by_name = {
+                        os.path.basename(path): int(label)
+                        for path, label in zip(clust_ref.pdb_files, clust_ref.labels)
+                    }
+                    selected_labels = [
+                        f"Cluster {display_cluster_id(cluster_by_name.get(name, -1))}: {name}"
+                        for name in selected_names
+                    ]
+                else:
+                    selected_names = input.superimpose_structures() or []
+                    if isinstance(selected_names, str):
+                        selected_names = [selected_names]
+                    else:
+                        selected_names = list(selected_names)
+                    selected_labels = list(selected_names)
+                if len(selected_names) < 2:
+                    return ui.p(
+                        "Select at least two models to superimpose.",
+                        style="padding: 20px; text-align: center;"
+                    )
+                path_by_name = {
+                    os.path.basename(path): path for path in clust_ref.pdb_files
+                }
+                pdb_files = [path_by_name.get(name) for name in selected_names]
+                if len(pdb_files) != len(selected_names) or any(path is None for path in pdb_files):
+                    return ui.p("One or more selected structures could not be found.")
+                viewer_html = create_molstar_superposition_html(
+                    pdb_files, structure_labels=selected_labels, width=900, height=650
+                )
+                return ui.HTML(viewer_html)
+
             structure_name = input.structure_select()
-            pdb_file = None
-            for f in clust_ref.pdb_files:
-                if os.path.basename(f) == structure_name:
-                    pdb_file = f
-                    break
+            if not structure_name:
+                return ui.p("Select a structure to view in 3D", style="padding: 20px; text-align: center;")
+            pdb_file = next((
+                path for path in clust_ref.pdb_files
+                if os.path.basename(path) == structure_name
+            ), None)
             
             if not pdb_file or not os.path.exists(pdb_file):
                 return ui.p(f"Structure not found: {structure_name}")

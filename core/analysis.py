@@ -189,7 +189,9 @@ class InterfaceAnalyzer:
                 'n_consensus': len(consensus),
                 'consensus_residues': ','.join(sorted(consensus)),
                 'top_residues': ','.join(top_hotspots.head(10)['residue'].tolist()),
-                'binding_mode': 'Noise' if cluster_id == -1 else f'Mode {cluster_id}'
+                'binding_mode': (
+                    'Noise' if cluster_id == -1 else f'Mode {int(cluster_id) + 1}'
+                )
             })
         
         return pd.DataFrame(rows)
